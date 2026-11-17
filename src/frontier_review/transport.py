@@ -130,13 +130,17 @@ class MockAnthropicTransport(BaseTransport):
     ) -> bytes:
         """Send a request and return the pre-configured response body as bytes.
 
-        Production code path is exercised: builds actual JSON payload,
-        routes to mock transport which returns configured response.
+        In single-scenario mode, the scenario is consumed on first call and
+        subsequent calls raise MockServerError (sequence exhausted).
         No network access occurs.
         """
         if self._configured_scenario is not None:
+            # Single-scenario: consume it and fall through to sequence check
             raw = self._configured_scenario._raw_body
-            return raw.encode("utf-8") if raw else b""
+            consumed_raw = raw.encode("utf-8") if raw else b""
+            self._configured_scenario = None
+            self._sequence_index = 1  # mark the one scenario as consumed in sequence too
+            return consumed_raw
 
         # Sequential mode — consume next scenario in queue
         if self._sequence_index >= len(self._sequence):
@@ -196,6 +200,7 @@ class MockAnthropicTransport(BaseTransport):
             "usage": {
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens,
                 "thinking_tokens": 0,
                 "cache_creation_tokens": 0,
                 "cache_read_tokens": 0,

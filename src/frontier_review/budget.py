@@ -45,6 +45,7 @@ def isolate_test_ledger() -> str:
 
     Returns the path to the temporary ledger for cleanup by the caller.
     """
+    global _LEDGER_PATH  # noqa: PLW0603
     led_path = tempfile.NamedTemporaryFile(
         suffix="_budget_ledger.json", delete=False, prefix="fr_"
     )

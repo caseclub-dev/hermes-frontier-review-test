@@ -83,10 +83,7 @@ class ReviewResult(BaseModel):
     def __str__(self) -> str:
         cost = 0.0
         if self.model_used:
-            try:
-                cost = self.token_usage.cost_estimate(self.model_used)
-            except ValueError:
-                cost = -1.0  # invalid model
+            cost = self.token_usage.cost_estimate(self.model_used)
         return (
             f"ReviewResult({self.status.value}, {self.operation}, "
             f"{len(self.findings)} findings, ${cost:.6f})"

@@ -37,6 +37,7 @@ class DelegationRequest:
     )
 
     def to_json(self) -> str:
+        from dataclasses import asdict
         return json.dumps(asdict(self), indent=2)
 
     @classmethod

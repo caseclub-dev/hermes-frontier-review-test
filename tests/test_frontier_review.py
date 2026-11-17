@@ -126,7 +126,7 @@ class TestModels:
     def test_token_usage_cost_non_opus_rejected(self):
         from frontier_review.models import TokenUsage
         t = TokenUsage(input_tokens=1_000_000)
-        with pytest.raises(ValueError, match="not in the allowed model list"):
+        with pytest.raises(ValueError, match="allowed Opus model"):
             t.cost_estimate("claude-sonnet-4")
 
     def test_finding_minimal(self):
@@ -352,7 +352,7 @@ class TestClient:
     def test_model_drift_detection(self):
         """If response model differs from requested, raise RuntimeError."""
         from frontier_review.client import AnthropicClient
-        from frontier_review.transport import MockAnthropicTransport
+        from frontier_review.transport import MockAnthropicTransport, ScenarioConfig
         mt = MockAnthropicTransport()
         # Configure with a DIFFERENT model — simulate drift
         cfg = ScenarioConfig(
@@ -489,7 +489,9 @@ class TestBudget:
 
     def test_check_budget_no_ledger(self):
         """When ledger file doesn't exist, budget check passes."""
-        from frontier_review.budget import set_ledger_override, reset_ledger_override
+        from frontier_review.budget import (
+            check_budget, isolate_test_ledger, reset_ledger_override, set_ledger_override,
+        )
         tmpdir = _tmpdir()
         try:
             fake_path = os.path.join(tmpdir, "nonexistent.json")
@@ -655,6 +657,7 @@ class TestReviewCycle:
 
     def test_full_review_cycle_pass(self):
         from frontier_review.orchestrator import run_review_cycle
+        from frontier_review.models import ReviewStatus
         from frontier_review.transport import MockAnthropicTransport
         mt = MockAnthropicTransport()
         mt.configure(MockAnthropicTransport.ok_response(status="pass", summary="All good."))
@@ -669,6 +672,7 @@ class TestReviewCycle:
 
     def test_full_review_cycle_changes_required(self):
         from frontier_review.orchestrator import run_review_cycle
+        from frontier_review.models import ReviewStatus
         from frontier_review.transport import MockAnthropicTransport
         mt = MockAnthropicTransport()
         findings = [{
@@ -693,17 +697,18 @@ class TestReviewCycle:
 
     def test_full_review_cycle_blocked_by_budget(self):
         """When budget is exceeded, review should be blocked."""
-        from frontier_review.budget import isolate_test_ledger, reset_ledger_override, record_request
+        from frontier_review.budget import (
+            isolate_test_ledger, record_request, reset_ledger_override,
+        )
         from frontier_review.orchestrator import run_review_cycle
+        from frontier_review.models import ReviewStatus
         from frontier_review.transport import MockAnthropicTransport
 
-        # Drain the test ledger first
+        # Create temp ledger with drained budget — 6M input tokens costs ~$92 (exceeds $75 monthly budget)
         tmp_path = isolate_test_ledger()
-        try:
-            record_request("claude-opus-5-5", 1_000_000, 32768)  # consumes most of $75 budget
-        finally:
-            reset_ledger_override()
+        record_request("claude-opus-5-5", 6_000_000, 32768)
 
+        # Review cycle runs while _LEDGER_PATH still points to the drained temp ledger
         mt = MockAnthropicTransport()
         mt.configure(MockAnthropicTransport.ok_response(status="pass"))
 
@@ -711,6 +716,11 @@ class TestReviewCycle:
             requirements="Test.", commit_sha="abc", diff="small diff here", mock_transport=mt,
         )
         assert result.status == ReviewStatus.BLOCKED
+
+        # Cleanup
+        reset_ledger_override()
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
         assert "Budget" in result.summary.lower() or "budget" in result.summary.lower()
 
 
