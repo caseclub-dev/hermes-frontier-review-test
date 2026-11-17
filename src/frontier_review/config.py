@@ -38,6 +38,9 @@ def get_max_tokens() -> int:
 
 _BUDGET_MONTHLY_USD = 75.0
 
+# Public alias for use by tests and other modules
+BUDGET_USD = _BUDGET_MONTHLY_USD
+
 
 def get_budget_monthly_usd() -> float:
     """Return the monthly budget cap in USD."""
