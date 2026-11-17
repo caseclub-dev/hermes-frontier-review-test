@@ -1,0 +1,46 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Runtime data
+.budget_ledger.json
+.budget_cache/
+state.json
+audit_log.json
+
+# Secrets — never commit API keys or tokens
+.env
+.env.local
+.env.*.local
+credentials.json
+api_key.txt
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+*.cover
+
+# Generated test data
+tests/fixtures/generated/
+tests/output/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Ledger / temporary budgets (per module)
+frontier_review/.budget_ledger.json*
