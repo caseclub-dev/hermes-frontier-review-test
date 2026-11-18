@@ -674,6 +674,40 @@ class WorkflowLedger:
 
         return True
 
+    # ── Correction job management (Phase 3 — auto Coder dispatch bridge) ──
+
+    def set_task_status(self, task_id: str, new_status: str, **extra_fields: Any) -> TaskRecord:
+        """Transition a task to a new status under exclusive lock.
+
+        Unlike ``finalize_task``, this method does not set a final disposition;
+        it updates the mutable status field for intermediate states such as
+        CORRECTION_PENDING or IN_PROGRESS.
+
+        Args:
+            task_id: The task to update.
+            new_status: Target status (e.g. 'CORRECTION_PENDING', 'IN_PROGRESS').
+            **extra_fields: Additional dict fields to write (e.g. correction_job).
+
+        Returns:
+            Updated TaskRecord.
+
+        Raises:
+            ValueError: If the task does not exist.
+        """
+        self._load_under_lock(task_id)
+        rec = self.get_task(task_id)
+        rec_data = self._data[task_id]
+        rec_data["status"] = new_status
+        rec_data["updated_at"] = datetime.now(timezone.utc).isoformat()
+        for key, value in extra_fields.items():
+            if key in rec_data:
+                rec_data[key] = value
+            else:
+                # Allow adding top-level fields beyond TaskRecord schema
+                rec_data[key] = value
+        self._save()
+        return self.get_task(task_id)
+
     def get_pending_tasks(self) -> list[TaskRecord]:
         """Return all tasks with status == PENDING_REVIEW."""
         pending = []

@@ -70,6 +70,7 @@ class Disposition:
     BLOCKED = "blocked"
     ESCALATED_ARCHITECT = "escalated_architect"
     MAX_CORRECTION_EXHAUSTED = "max_correction_exhausted"
+    CORRECTION_NEEDED = "correction_needed"  # Phase 3 — dispatch Coder instead of looping
 
 
 class AutonomousCorrectionLoop:
@@ -414,7 +415,7 @@ class AutonomousCorrectionLoop:
                 self.ledger.finalize_task(task_id, ws.final_disposition)
                 return ws
 
-            # CHANGES_REQUIRED or NEEDS_EVIDENCE → continue loop
+            # CHANGES_REQUIRED or NEEDS_EVIDENCE → persist findings and exit for Coder dispatch (Phase 3)
             ws.task_record.correction_count += 1
             self.ledger.increment_correction_count(task_id)
 
@@ -423,6 +424,34 @@ class AutonomousCorrectionLoop:
                 ws.task_record.final_disposition = Disposition.MAX_CORRECTION_EXHAUSTED
                 self.ledger.finalize_task(task_id, ws.final_disposition)
                 return ws
+
+            # Persist review findings for Coder dispatch and set CORRECTION_PENDING status.
+            # The correction loop exits here so the orchestrator dispatcher can invoke
+            # real Coder (profile="coder") via delegate_task without blocking the
+            # controller subprocess or exhausting its timeout budget.
+            self._write_correction_job_file(
+                task_id=task_id,
+                workspace_path=self.workspace_path,
+                current_sha=current_sha,
+                findings=finding_dicts,
+                requirements=requirements,
+                acceptance_criteria=acceptance_criteria if acceptance_criteria else [],
+                code_context=code_context_str,
+            )
+
+            # Transition task to CORRECTION_PENDING under lock.
+            try:
+                self.ledger.set_task_status(
+                    task_id, "CORRECTION_PENDING",
+                    correction_job=os.path.basename(self._correction_job_path(task_id)),
+                )
+            except ValueError:
+                pass  # Task may not exist yet; findings are persisted on disk.
+
+            ws.final_disposition = Disposition.CORRECTION_NEEDED
+            ws.task_record.final_disposition = Disposition.CORRECTION_NEEDED
+            self.ledger._save()
+            return ws
 
         # Should not reach here; safety fallback
         ws.final_disposition = Disposition.CHANGES_REQUIRED
@@ -952,3 +981,43 @@ class AutonomousCorrectionLoop:
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         return request
+
+    # ── Correction job file helpers (Phase 3) ──
+
+    def _correction_job_path(self, task_id: str) -> str:
+        """Return the absolute path of the correction job file for *task_id*."""
+        jobs_dir = os.path.join(self.workspace_path, "correction_jobs")
+        os.makedirs(jobs_dir, exist_ok=True)
+        return os.path.join(jobs_dir, f"{task_id}.json")
+
+    def _write_correction_job_file(
+        self,
+        task_id: str,
+        workspace_path: str,
+        current_sha: str,
+        findings: list[dict],
+        requirements: str | None,
+        acceptance_criteria: list[str] | None,
+        code_context: str = "",
+    ) -> None:
+        """Persist the full correction request to a durable JSON job file.
+
+        The orchestrator dispatcher reads this file when it detects CORRECTION_PENDING
+        and dispatches real Coder (profile="coder") via delegate_task.
+        """
+        payload = {
+            "version": "1.0",
+            "task_id": task_id,
+            "workspace_path": workspace_path,
+            "current_sha": current_sha,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "findings": findings,
+            "requirements": requirements or "",
+            "acceptance_criteria": acceptance_criteria or [],
+            "code_context": code_context,
+        }
+        job_path = self._correction_job_path(task_id)
+        tmp_path = job_path + ".tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(payload, f, indent=2, default=str)
+        os.replace(tmp_path, job_path)
