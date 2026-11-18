@@ -261,7 +261,7 @@ def run_full_m4b_pipeline(
 
     # For the initial review we use GitWorkspaceVerifier directly because
     # there's no Coder delegation — just an existing buggy commit.
-    ws = create_demo_workspace(workspace_base)
+    ws, test_script_path = create_demo_workspace(workspace_base)
     verifier = GitWorkspaceVerifier(ws)
 
     # Get test output and code content for initial review
