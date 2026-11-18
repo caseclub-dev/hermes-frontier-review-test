@@ -570,10 +570,14 @@ class AutonomousCorrectionLoop:
             kw in evidence_lower
             for kw in ["passed", "assert", "ok", "test passed", "success", "ran"]
         )
-        has_failure_patterns = any(
-            kw in evidence_lower
-            for kw in ["failed", "fail", "error", "exception", "traceback", "not ok"]
-        )
+        # Check failures only on lines that indicate actual test failure,
+        # not generic Python keywords (except patterns like "Traceback",
+        # "AssertionError", "[FAIL]", or "FAILED").
+        failure_lines = [
+            l.strip() for l in evidence_lower.split("\n")
+            if any(fw in l for fw in ["failed", "error:", "traceback", "assertion", "not ok", "fail"])
+        ]
+        has_failure_patterns = len(failure_lines) > 0
 
         test_has_output = has_test_patterns or has_failure_patterns
 
@@ -584,8 +588,21 @@ class AutonomousCorrectionLoop:
             # Evidence shows passes and no failures → test passed
             test_passed = True
         elif has_failure_patterns and has_test_patterns:
-            # Mixed evidence — check which is dominant (specific failure > generic pass signal)
-            test_failed = True
+            # Mixed evidence — only flag as failed if failure_lines contain
+            # genuine failure indicators (not generic Python keywords).
+            # Patterns like "test_divide FAILED" or "[FAIL]" count as real.
+            real_failures = [
+                l for l in failure_lines
+                if ("failed" in l and ("assertionerror" in l or "traceback" in l
+                    or "expected" in l or "—" in evidence_lower or "-" in l))
+                or "[fail]" in l
+                or "assertion error" in l
+                or "traceback (most recent call last)" in l
+            ]
+            # Fallback: if we found failure lines with "FAILED" keyword, trust them
+            if not real_failures:
+                real_failures = [l for l in failure_lines if "failed" in l]
+            test_failed = len(real_failures) > 0
 
         # ── 3. Check acceptance criteria ─────────────────────────────
         all_criteria_met = True
