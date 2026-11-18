@@ -21,26 +21,31 @@ Modules
 - ``budget``        – ledger management, cost estimation, budget checks
 - ``state``         – persistent task-state machine (PENDING → COMPLETE)
 - ``delegation_adapter`` – adapter for delegating review feedback to Coder
-- ``orchestrator``  – workflow orchestration entry point
+- ``orchestrator``  – workflow orchestration with bounded autonomous loop
 
 No live API calls are made unless explicitly enabled in a future phase.
 """
 
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 # ── Public symbols ---------------------------------------------------
 
-from .config import ALLOWED_MODEL, get_model, validate_model, get_max_tokens, get_budget_monthly_usd  # noqa: E402
-from .models import ReviewStatus, TokenUsage, Finding, ReviewResult, HealthStatus, CycleStatus  # noqa: E402
+from .config import (  # noqa: E402
+    ALLOWED_MODEL, get_model, validate_model, get_max_tokens, get_budget_monthly_usd,
+)
+from .models import (  # noqa: E402
+    ReviewStatus, TokenUsage, Finding, ReviewResult, HealthStatus, CycleStatus,
+)
 from .client import AnthropicClient  # noqa: E402
 from .transport import (  # noqa: E402
-    TransportError,
-    MockServerError,
-    MockRateLimitError,
-    MockTimeoutError,
-    MockAnthropicTransport,
+    TransportError, MockServerError, MockRateLimitError, MockTimeoutError,
+    RealApiDisabledError, ScenarioConfig, MockAnthropicTransport,
+)
+from .orchestrator import (  # noqa: E402
+    FrontierOrchestrator, ReviewLoopError, EscalationRequired, run_review_cycle,
+    run_autonomous_review_cycle,
 )
 
 __all__ = [
@@ -60,5 +65,12 @@ __all__ = [
     "MockServerError",
     "MockRateLimitError",
     "MockTimeoutError",
+    "RealApiDisabledError",
+    "ScenarioConfig",
     "MockAnthropicTransport",
+    "FrontierOrchestrator",
+    "ReviewLoopError",
+    "EscalationRequired",
+    "run_review_cycle",
+    "run_autonomous_review_cycle",
 ]

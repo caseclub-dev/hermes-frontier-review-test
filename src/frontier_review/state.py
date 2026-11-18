@@ -27,7 +27,7 @@ class TaskState:
     requirements: str = ""
     last_review_result: str = ""  # JSON string of ReviewResult or empty
     findings_count: int = 0
-    corrections_made: bool = False
+    corrections_made: int = 0  # number of correction cycles attempted
     max_reviews: int = 5
     review_count: int = 0
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())

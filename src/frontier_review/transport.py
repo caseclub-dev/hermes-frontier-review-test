@@ -97,6 +97,18 @@ class MockAnthropicTransport(BaseTransport):
 
     Mock mode NEVER falls through to a real API call — send_request
     only returns pre-configured responses or raises mock errors.
+
+    Scenario builders provide factory methods for common review outcomes:
+      - ok_response        → PASS / CHANGES_REQUIRED / BLOCKED
+      - server_error       → 500 internal error
+      - rate_limit_error   → 429 throttling
+      - timeout_error      → simulated timeout
+      - malformed_response → unparseable JSON
+      - model_drift        → unexpected model identifier
+      - auth_failure       → API key / authentication failure
+      - budget_exhaustion  → $0 remaining, review blocked
+      - interrupted_task   → mid-request abort simulation
+      - duplicate_request  → idempotency key collision
     """
 
     def __init__(self) -> None:
@@ -170,6 +182,9 @@ class MockAnthropicTransport(BaseTransport):
         status: str = "pass",
         summary: str = "Review completed.",
         findings: list[dict[str, Any]] | None = None,
+        requirements_met: list[str] | None = None,
+        blockers: list[str] | None = None,
+        suggestions: list[str] | None = None,
         input_tokens: int = 15000,
         output_tokens: int = 2000,
     ) -> ScenarioConfig:
@@ -180,15 +195,20 @@ class MockAnthropicTransport(BaseTransport):
         """
         if findings is None:
             findings = []
+        if requirements_met is None:
+            requirements_met = []
+        if blockers is None:
+            blockers = [] if status != "blocked" else ["reason this cannot proceed"]
+        if suggestions is None:
+            suggestions = ["improvement recommendations"]
 
-        # Build the inner review payload that matches _parse_json_response expectations
         review_payload = {
             "status": status,
             "summary": summary,
             "findings": findings,
-            "requirements_met": [],
-            "blockers": [] if status != "blocked" else ["reason this cannot proceed"],
-            "suggestions": ["improvement recommendations"],
+            "requirements_met": requirements_met,
+            "blockers": blockers,
+            "suggestions": suggestions,
         }
 
         body = {
@@ -224,6 +244,159 @@ class MockAnthropicTransport(BaseTransport):
             _raw_body=json.dumps({
                 "error": {"type": "api_error", "message": message},
             }),
+        )
+
+    @staticmethod
+    def rate_limit_response() -> ScenarioConfig:
+        """Return a config for a 429 rate-limit scenario."""
+        return ScenarioConfig(
+            status_code=429,
+            headers={"content-type": "application/json"},
+            _raw_body=json.dumps({
+                "error": {
+                    "type": "rate_limit_error",
+                    "message": "Rate limit exceeded. Please retry after 60s.",
+                },
+            }),
+        )
+
+    @staticmethod
+    def timeout_response() -> ScenarioConfig:
+        """Return a config for a simulated timeout scenario.
+
+        Returns an empty body — the client interprets this as a timeout.
+        """
+        return ScenarioConfig(
+            status_code=0,  # Signal: no response received
+            headers={},
+            _raw_body="",
+        )
+
+    @staticmethod
+    def malformed_response(raw_text: str = "not json {{{") -> ScenarioConfig:
+        """Return a config with unparseable JSON body."""
+        return ScenarioConfig(
+            status_code=200,
+            headers={"content-type": "application/json"},
+            _raw_body=raw_text,
+        )
+
+    @staticmethod
+    def model_drift_response(unexpected_model: str = "claude-sonnet-4") -> ScenarioConfig:
+        """Return a config with an unexpected model identifier.
+
+        This exercises the client's model-drift detection path.
+        """
+        body = {
+            "id": f"msg-{uuid.uuid4().hex[:8]}",
+            "model": unexpected_model,  # WRONG MODEL — triggers drift check
+            "content": [{"type": "text", "text": json.dumps({
+                "status": "pass",
+                "summary": "Model drift response.",
+                "findings": [],
+            })}],
+            "usage": {
+                "input_tokens": 15000,
+                "output_tokens": 2000,
+                "total_tokens": 17000,
+                "thinking_tokens": 0,
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+            },
+        }
+        return ScenarioConfig(
+            status_code=200,
+            headers={"content-type": "application/json"},
+            _raw_body=json.dumps(body),
+            input_tokens=15000,
+            output_tokens=2000,
+        )
+
+    @staticmethod
+    def auth_failure_response(message: str = "Invalid API key") -> ScenarioConfig:
+        """Return a config for an authentication failure."""
+        return ScenarioConfig(
+            status_code=401,
+            headers={"content-type": "application/json"},
+            _raw_body=json.dumps({
+                "error": {
+                    "type": "authentication_error",
+                    "message": message,
+                },
+            }),
+        )
+
+    @staticmethod
+    def budget_exhaustion_response() -> ScenarioConfig:
+        """Return a config simulating that the review budget is exhausted."""
+        body = {
+            "id": f"msg-{uuid.uuid4().hex[:8]}",
+            "model": "claude-opus-5-5",
+            "content": [{"type": "text", "text": json.dumps({
+                "status": "blocked",
+                "summary": "Review blocked — budget exhausted.",
+                "findings": [],
+                "blockers": ["Monthly review budget has been reached."],
+            })}],
+            "usage": {
+                "input_tokens": 15000,
+                "output_tokens": 200,
+                "total_tokens": 15200,
+                "thinking_tokens": 0,
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+            },
+        }
+        return ScenarioConfig(
+            status_code=403,  # Simulate budget ceiling
+            headers={"content-type": "application/json"},
+            _raw_body=json.dumps(body),
+            input_tokens=15000,
+            output_tokens=200,
+        )
+
+    @staticmethod
+    def interrupted_task_response() -> ScenarioConfig:
+        """Return a config simulating an interrupted request.
+
+        The body is truncated mid-JSON — exercises partial-parse handling.
+        """
+        return ScenarioConfig(
+            status_code=200,
+            headers={"content-type": "application/json"},
+            _raw_body='{"status": "changes_required", "summ',  # Truncated!
+        )
+
+    @staticmethod
+    def duplicate_request_response(original_id: str = "req-dup-abc123") -> ScenarioConfig:
+        """Return a config for a duplicate / idempotent request.
+
+        Returns the original request's result to exercise deduplication logic.
+        """
+        body = {
+            "id": f"msg-{uuid.uuid4().hex[:8]}",
+            "model": "claude-opus-5-5",
+            "content": [{"type": "text", "text": json.dumps({
+                "status": "pass",
+                "summary": "Duplicate request — returning original result.",
+                "findings": [],
+                "requirements_met": ["original_request_id"],
+            })}],
+            "usage": {
+                "input_tokens": 15000,
+                "output_tokens": 200,
+                "total_tokens": 15200,
+                "thinking_tokens": 0,
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+            },
+        }
+        return ScenarioConfig(
+            status_code=200,
+            headers={"content-type": "application/json"},
+            _raw_body=json.dumps(body),
+            input_tokens=15000,
+            output_tokens=200,
         )
 
 
