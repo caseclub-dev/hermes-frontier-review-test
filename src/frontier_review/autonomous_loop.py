@@ -135,6 +135,9 @@ class AutonomousCorrectionLoop:
         # Cumulative cost tracking (across runs for this instance)
         self._instance_costs: dict[str, float] = {}
 
+        # Fallback SHA for re-entry from a prior run (Part 2 — SHA sync fix)
+        self._initial_commit_sha: str = ""
+
     def _init_client_with_transport(
         self, transport: Optional[MockAnthropicTransport] = None
     ) -> None:
@@ -142,6 +145,38 @@ class AutonomousCorrectionLoop:
         if transport is not None:
             self.client.set_transport(transport)
         # Otherwise the client uses evidence-aware internal pipeline
+
+    def _sync_current_sha(self, task_id: str) -> str:
+        """Sync current_sha from ledger (fix for SHA never updating between iterations).
+
+        On first call, stores initial_commit_sha as fallback. On subsequent calls
+        within the same loop iteration, reads the latest current_sha from the ledger
+        to pick up any correction-committed changes.
+
+        Args:
+            task_id: The task whose SHA to sync.
+
+        Returns:
+            The synced current SHA string.
+        """
+        # First call: initialize fallback
+        if not self._initial_commit_sha:
+            try:
+                rec = self.ledger.get_task(task_id)
+                self._initial_commit_sha = rec.current_sha or rec.original_sha
+            except ValueError:
+                pass
+
+        # Read latest from ledger (handles both first-run and post-correction updates)
+        try:
+            rec = self.ledger.get_task(task_id)
+            sha = rec.current_sha
+            if sha:
+                return sha
+        except ValueError:
+            pass
+
+        return self._initial_commit_sha
 
     def _create_workflow_state(
         self,
@@ -218,10 +253,14 @@ class AutonomousCorrectionLoop:
             # Use evidence-aware pipeline (no external transport injection)
             pass
 
-        current_sha = initial_commit_sha
+        # Store initial SHA as fallback for re-entry from prior run
+        self._initial_commit_sha = initial_commit_sha
+
         code_context_str = code_context or ""
 
         while True:
+            # ── Sync current SHA from ledger (Part 2 — SHA sync fix) ───
+            current_sha = self._sync_current_sha(task_id)
             # ── Check pre-review bounds ──────────────────────────────
             review_count = self.ledger.get_task_review_count(task_id)
             if review_count >= self.max_reviews:

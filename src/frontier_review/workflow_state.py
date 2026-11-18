@@ -7,11 +7,12 @@ and budget exhaustion tracking.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 
 
@@ -40,6 +41,11 @@ class TaskRecord:
     updated_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
+    # ── Task claiming fields (Part 1 — cron-driven review controller) ──
+    status: str = "PENDING_REVIEW"
+    claim_worker: str = ""
+    claim_time: str = ""
+    claim_expires_at: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize for JSON storage."""
@@ -369,9 +375,239 @@ class WorkflowLedger:
         rec = self.get_task(task_id)
         rec_data = self._data[task_id]
         rec_data["final_disposition"] = disposition
+        # Update status to reflect final state
+        if disposition in ("ready_for_operator_review", "changes_required",
+                           "blocked", "escalated_architect",
+                           "max_correction_exhausted"):
+            rec_data["status"] = disposition
         rec_data["updated_at"] = datetime.now(timezone.utc).isoformat()
         self._save()
         return rec
+
+    # ── Task claiming (Part 1 — cron-driven review controller) ─────────
+
+    def _atomic_write(self, raw: dict[str, Any]) -> None:
+        """Write ledger dict to disk atomically."""
+        try:
+            tmp_path = self._path + ".tmp"
+            with open(tmp_path, "w") as f:
+                json.dump(raw, f, indent=2, default=str)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self._path)
+        except OSError:
+            with open(self._path, "w") as f:
+                json.dump(raw, f, indent=2, default=str)
+                f.flush()
+
+    def create_pending_task(
+        self,
+        task_id: str,
+        requirements: str,
+        workspace_path: str,
+        acceptance_criteria: str = "",
+        cost_ceiling_usd: float = 10.0,
+    ) -> TaskRecord:
+        """Create a PENDING_REVIEW task record (idempotent).
+
+        Args:
+            task_id: Unique identifier for this review task.
+            requirements: What the code must satisfy.
+            workspace_path: Path to the disposable workspace.
+            acceptance_criteria: JSON string or description of acceptance criteria.
+            cost_ceiling_usd: Per-task simulated cost ceiling (default $10).
+
+        Returns:
+            The newly created TaskRecord.
+
+        Raises:
+            ValueError: If a task with this id already exists with a final disposition.
+        """
+        if task_id in self._data:
+            existing = TaskRecord.from_dict(self._data[task_id])
+            # Idempotent: return existing for non-final states
+            if existing.status in ("PENDING_REVIEW", ""):
+                return existing
+            # Final disposition — do not overwrite
+            raise ValueError(
+                f"Task '{task_id}' already exists with final disposition "
+                f"'{existing.final_disposition}'. Cannot re-create."
+            )
+
+        now = datetime.now(timezone.utc).isoformat()
+        record = TaskRecord(
+            task_id=task_id,
+            requirements=requirements,
+            workspace_path=workspace_path,
+            created_at=now,
+            updated_at=now,
+            status="PENDING_REVIEW",
+        )
+        self._data[task_id] = record.to_dict()
+        self._save()
+        return record
+
+    def claim_task(
+        self,
+        task_id: str,
+        worker_id: str = "controller",
+        ttl_seconds: int = 300,
+    ) -> Optional[TaskRecord]:
+        """Atomically transition PENDING_REVIEW → IN_PROGRESS.
+
+        Uses fcntl.flock for cross-process safety with 5x retry on EACCES.
+
+        Args:
+            task_id: The task to claim.
+            worker_id: Identity of the claiming worker.
+            ttl_seconds: How long the claim lasts (default 300s).
+
+        Returns:
+            The claimed TaskRecord, or None if unavailable.
+        """
+        import time
+
+        for attempt in range(5):
+            try:
+                return self._claim_task_inner(task_id, worker_id, ttl_seconds)
+            except PermissionError:
+                if attempt < 4:
+                    time.sleep(0.1)
+                else:
+                    raise
+        return None
+
+    def _claim_task_inner(
+        self,
+        task_id: str,
+        worker_id: str,
+        ttl_seconds: int,
+    ) -> Optional[TaskRecord]:
+        """Inner implementation of claim_task (inside lock)."""
+        # Read → flock → modify → write back → unlock
+        try:
+            with open(self._path) as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                raw = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return None
+
+        if task_id not in raw:
+            return None
+
+        rec = TaskRecord.from_dict(raw[task_id])
+        # Must be PENDING_REVIEW to claim
+        if rec.status != "PENDING_REVIEW":
+            return None
+
+        now = datetime.now(timezone.utc)
+        expires = now + timedelta(seconds=ttl_seconds)
+
+        raw[task_id]["status"] = "IN_PROGRESS"
+        raw[task_id]["claim_worker"] = worker_id
+        raw[task_id]["claim_time"] = now.isoformat()
+        raw[task_id]["claim_expires_at"] = expires.isoformat()
+        raw[task_id]["updated_at"] = now.isoformat()
+
+        # Update in-memory state for same-process callers
+        self._data[task_id] = raw[task_id]
+
+        # Write back to disk atomically
+        try:
+            self._atomic_write(raw)
+        except OSError:
+            pass  # In-memory data is already updated; disk write failure is non-fatal here
+
+        # Return fresh TaskRecord from the updated data
+        return TaskRecord.from_dict(raw[task_id])
+
+    def release_task(
+        self,
+        task_id: str,
+        reason: str = "expired",
+    ) -> bool:
+        """Release an IN_PROGRESS claim back to PENDING_REVIEW.
+
+        Args:
+            task_id: The task to release.
+            reason: Why the claim was released (logged in updated_at).
+
+        Returns:
+            True if released, False if not in IN_PROGRESS state.
+        """
+        try:
+            with open(self._path) as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                raw = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return False
+
+        if task_id not in raw:
+            return False
+
+        rec = TaskRecord.from_dict(raw[task_id])
+        if rec.status != "IN_PROGRESS":
+            return False
+
+        now = datetime.now(timezone.utc).isoformat()
+        raw[task_id]["status"] = "PENDING_REVIEW"
+        raw[task_id]["claim_worker"] = ""
+        raw[task_id]["claim_time"] = ""
+        raw[task_id]["claim_expires_at"] = ""
+        raw[task_id]["updated_at"] = now
+
+        # Update in-memory state for same-process callers
+        self._data[task_id] = raw[task_id]
+
+        try:
+            self._atomic_write(raw)
+        except OSError:
+            pass  # In-memory data is already updated; disk write failure is non-fatal
+
+        return True
+
+    def get_pending_tasks(self) -> list[TaskRecord]:
+        """Return all tasks with status == PENDING_REVIEW."""
+        pending = []
+        for task_id, data in self._data.items():
+            rec = TaskRecord.from_dict(data)
+            if rec.status == "PENDING_REVIEW":
+                pending.append(rec)
+        # Sort by created_at for deterministic ordering
+        pending.sort(key=lambda r: r.created_at)
+        return pending
+
+    def find_expired_claims(
+        self,
+        max_ttl_seconds: int = 600,
+    ) -> list[TaskRecord]:
+        """Return all IN_PROGRESS tasks whose claim has expired.
+
+        A claim is expired if the current time exceeds claim_expires_at.
+
+        Args:
+            max_ttl_seconds: Maximum TTL threshold for considering a claim expired.
+
+        Returns:
+            List of expired TaskRecords sorted by claim_time (oldest first).
+        """
+        now = datetime.now(timezone.utc)
+        expired = []
+        for task_id, data in self._data.items():
+            rec = TaskRecord.from_dict(data)
+            if rec.status != "IN_PROGRESS":
+                continue
+            if not rec.claim_expires_at:
+                continue
+            try:
+                expires = datetime.fromisoformat(rec.claim_expires_at)
+                if now > expires and (now - expires).total_seconds() < max_ttl_seconds:
+                    expired.append(rec)
+            except (ValueError, TypeError):
+                # Malformed timestamp — treat as expired
+                expired.append(rec)
+        expired.sort(key=lambda r: r.claim_time or "")
+        return expired
 
     @staticmethod
     def compute_fingerprint(commit_sha: str, test_evidence: str) -> str:
