@@ -48,6 +48,18 @@ class TaskRecord:
     claim_time: str = ""
     claim_expires_at: str = ""
 
+    # ── PR-based review integration (Phase 3C additive fields) ─────────
+    repo_owner: str = ""
+    repo_name: str = ""
+    pr_number: int = 0
+    pr_url: str = ""
+    head_branch: str = ""
+    base_branch: str = ""
+    remote_head_sha: str = ""
+    initial_remote_sha: str = ""
+    review_status: str = "unreviewed"  # unreviewed | changes_required | pass | blocked | correction_exhausted
+    evidence_fingerprint: str = ""
+
     def to_dict(self) -> dict[str, Any]:
         """Serialize for JSON storage."""
         return asdict(self)
