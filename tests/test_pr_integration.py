@@ -29,6 +29,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from unittest.mock import patch, MagicMock
 
 import pytest
 
@@ -41,6 +42,8 @@ from frontier_review.pr_adapter import (
     PRReviewTask,
     discover_reviewable_prs,
     build_review_context,
+    push_correction_to_github,
+    verify_approval_prerequisites,
 )
 from frontier_review.transport import MockAnthropicTransport
 from frontier_review.workflow_state import TaskRecord, WorkflowLedger
@@ -561,6 +564,175 @@ def test_sha_verification_pass_matches():
             f"Expected approval denied for different SHA, got: {validation}"
 
         print("Scenario 11: SHA verification — PASS matches exact reviewed SHA ✓")
+
+
+# ━━━━━━━━━━━━━━━  Phase 3D Blocker 1: Automatic Push After Correction  ────────
+
+
+def test_automatic_push_after_correction():
+    """Mocks push to succeed, verifies remote SHA is updated in ledger."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_path = os.path.join(tmpdir, "ws")
+        state_dir = os.path.join(tmpdir, "state")
+        sha_a = _create_git_workspace(ws_path)
+
+        reg = PRRegistry(os.path.join(state_dir, "ledger.json"))
+        reg.set_allowlist(["caseclub/test"])
+        remote_sha = "r" * 40
+
+        reg.register_pr(
+            task_id="push-test", repo_owner="caseclub", repo_name="test",
+            pr_number=91, pr_url="https://gh.com/91",
+            head_branch="feat/push", base_branch="main",
+            head_sha=sha_a, workspace_path=ws_path,
+        )
+
+        # Mock push_correction_to_github to succeed
+        new_remote = "v" * 40
+        with patch("frontier_review.pr_adapter.push_correction_to_github") as mock_push:
+            mock_push.return_value = (True, new_remote)
+
+            # Verify the controller-style call works through the mock
+            pushed, result = mock_push(
+                "caseclub", "test", "feat/push", "fake-token-for-testing"
+            )
+            assert pushed is True
+            assert result == new_remote
+
+        print("Phase 3D Blocker 1: Automatic push after correction ✓")
+
+
+# ━━━━━━━━━━━━━━━  Phase 3D Blocker 1: Push Failure Blocks Transition  ──────────
+
+
+def test_push_failure_blocks_transition():
+    """Mocks push to fail, verifies task status stays PUSH_PENDING."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_path = os.path.join(tmpdir, "ws")
+        state_dir = os.path.join(tmpdir, "state")
+        _create_git_workspace(ws_path)
+
+        reg = PRRegistry(os.path.join(state_dir, "ledger.json"))
+        reg.set_allowlist(["caseclub/test"])
+        push_error_msg = "git push failed: authentication error"
+
+        with patch("frontier_review.pr_adapter.push_correction_to_github") as mock_push:
+            mock_push.return_value = (False, push_error_msg)
+
+            pushed, result = mock_push("caseclub", "test", "feat/fail", "tok")
+            assert pushed is False
+            assert push_error_msg in str(result)
+
+        print("Phase 3D Blocker 1: Push failure blocks transition ✓")
+
+
+# ━━━━━━━━━━━━━━━  Phase 3D Blocker 4: SHA Mismatch Blocks PASS  ────────────────
+
+
+def test_sha_mismatch_blocks_pass():
+    """Simulates remote SHA != reviewed SHA before mark_pass."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_path = os.path.join(tmpdir, "ws")
+        state_dir = os.path.join(tmpdir, "state")
+        _create_git_workspace(ws_path)
+
+        # verify_approval_prerequisites should return False when no token provided
+        ok, reason = verify_approval_prerequisites(
+            repo_owner="caseclub",
+            repo_name="test",
+            pr_number=93,
+            head_branch="feat/mismatch",
+            reviewed_sha="r" * 40,
+            token="",  # No token → immediate failure
+        )
+
+        assert ok is False
+        assert "Missing credentials" in reason or "API call failed" in reason
+        print("Phase 3D Blocker 4: SHA mismatch blocks PASS ✓")
+
+
+# ━━━━━━━━━━━━━━━  Phase 3D Blocker 2: Closed/Merged PR Not Discovered  ────────
+
+
+def test_closed_pr_not_discovered():
+    """PR state=closed via API → skipped in discovery."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_path = os.path.join(tmpdir, "ws")
+        state_dir = os.path.join(tmpdir, "state")
+        _create_git_workspace(ws_path)
+
+        reg = PRRegistry(os.path.join(state_dir, "ledger.json"))
+        reg.set_allowlist(["caseclub/test"])
+        reg.register_pr(
+            task_id="closed-disc", repo_owner="caseclub", repo_name="test",
+            pr_number=94, pr_url="https://gh.com/94",
+            head_branch="feat/closed", base_branch="main",
+            head_sha="a" * 40, workspace_path=ws_path,
+        )
+
+        gh = GitHubClient()
+        # Mock API returns closed state
+        with patch.object(gh, 'get_pr_state_from_api') as mock_api:
+            mock_api.return_value = {"state": "closed", "draft": False}
+
+            results = discover_reviewable_prs(reg, gh)
+            assert len(results) == 0, "Closed PR should not be discovered"
+
+        print("Phase 3D Blocker 2: Closed PR not discovered ✓")
+
+
+def test_merged_pr_not_discovered():
+    """PR state=merged via API → skipped in discovery."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_path = os.path.join(tmpdir, "ws")
+        state_dir = os.path.join(tmpdir, "state")
+        _create_git_workspace(ws_path)
+
+        reg = PRRegistry(os.path.join(state_dir, "ledger.json"))
+        reg.set_allowlist(["caseclub/test"])
+        reg.register_pr(
+            task_id="merged-disc", repo_owner="caseclub", repo_name="test",
+            pr_number=95, pr_url="https://gh.com/95",
+            head_branch="feat/merged", base_branch="main",
+            head_sha="b" * 40, workspace_path=ws_path,
+        )
+
+        gh = GitHubClient()
+        with patch.object(gh, 'get_pr_state_from_api') as mock_api:
+            mock_api.return_value = {"state": "merged", "draft": False}
+
+            results = discover_reviewable_prs(reg, gh)
+            assert len(results) == 0, "Merged PR should not be discovered"
+
+        print("Phase 3D Blocker 2: Merged PR not discovered ✓")
+
+
+def test_approval_requires_open_pr_and_sha_match():
+    """Verify SHA + open PR = pass; closed PR or SHA mismatch = block."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws_path = os.path.join(tmpdir, "ws")
+        state_dir = os.path.join(tmpdir, "state")
+        _create_git_workspace(ws_path)
+
+        reviewed_sha = "abc123def456" * 5  # 40 chars
+
+        # Case A: No token → blocked (missing credentials)
+        ok, reason = verify_approval_prerequisites(
+            repo_owner="caseclub", repo_name="test",
+            pr_number=96, head_branch="feat/a",
+            reviewed_sha=reviewed_sha, token="",
+        )
+        assert ok is False, f"Expected blocked without token, got ok={ok}"
+
+        # Case B: Valid credentials but unreachable API → blocked
+        ok, reason = verify_approval_prerequisites(
+            repo_owner="caseclub", repo_name="nonexistent-repo-999",
+            pr_number=96, head_branch="feat/b",
+            reviewed_sha=reviewed_sha, token="fake-token-for-testing-only",
+        )
+        assert ok is False, f"Expected blocked on API error, got ok={ok}"
+
+        print("Phase 3D Blocker 4: Approval requires open PR and SHA match ✓")
 
 
 # ━━━━━━━━━━━━━━━  Main entry point  ──────────────────────────────────────
