@@ -20,8 +20,9 @@ Modules
 - ``review``        – prompt builders, response parsing, post-processing
 - ``budget``        – ledger management, cost estimation, budget checks
 - ``state``         – persistent task-state machine (PENDING → COMPLETE)
-- ``delegation_adapter`` – adapter for delegating review feedback to Coder
-- ``orchestrator``  – workflow orchestration with bounded autonomous loop
+|- ``delegation_adapter`` – adapter for delegating review feedback to Coder
+|- ``coder_integration``  – M3: real Coder delegation via delegate_task (M3 milestone)
+|- ``orchestrator``  – workflow orchestration with bounded autonomous loop
 
 No live API calls are made unless explicitly enabled in a future phase.
 """
@@ -46,6 +47,13 @@ from .transport import (  # noqa: E402
 from .orchestrator import (  # noqa: E402
     FrontierOrchestrator, ReviewLoopError, EscalationRequired, run_review_cycle,
     run_autonomous_review_cycle,
+)
+from .coder_integration import (  # noqa: E402
+    DelegationResult, CodeReviewFeedback, Severity, FindingCategory,
+    build_initial_delegation_request, build_correction_delegation_request,
+    parse_delegation_response, GitWorkspaceVerifier, compute_evidence_fingerprint,
+    create_disposable_workspace, MockReviewSimulator, CorrectionLoopRunner,
+    handle_delegation_failure, is_duplicate_review, is_max_correction_cycles,
 )
 
 __all__ = [
@@ -73,4 +81,20 @@ __all__ = [
     "EscalationRequired",
     "run_review_cycle",
     "run_autonomous_review_cycle",
+    # M3 — real Coder integration
+    "DelegationResult",
+    "CodeReviewFeedback",
+    "Severity",
+    "FindingCategory",
+    "build_initial_delegation_request",
+    "build_correction_delegation_request",
+    "parse_delegation_response",
+    "GitWorkspaceVerifier",
+    "compute_evidence_fingerprint",
+    "create_disposable_workspace",
+    "MockReviewSimulator",
+    "CorrectionLoopRunner",
+    "handle_delegation_failure",
+    "is_duplicate_review",
+    "is_max_correction_cycles",
 ]
