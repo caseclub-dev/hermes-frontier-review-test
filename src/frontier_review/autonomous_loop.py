@@ -1181,17 +1181,27 @@ class AutonomousCorrectionLoop:
                 )
                 outf.write(f"stdout:\n{proc.stdout}\n\nstderr:\n{proc.stderr}\nexit_code:{proc.returncode}")
 
-            # Parse new SHA from Coder output
+            # Parse new SHA from Coder output; fall back to git log if not present
             new_sha = self._extract_new_sha(proc.stdout, previous_sha)
 
+            # Fallback: read current HEAD from workspace directly
             if not new_sha or new_sha == previous_sha:
-                return {
-                    "success": False,
-                    "previous_sha": previous_sha,
-                    "new_sha": None,
-                    "error": "Coder did not produce a new commit SHA" + (f" (exit code: {proc.returncode})" if proc.returncode != 0 else ""),
-                    "output_path": output_path,
-                }
+                git_head_result = subprocess.run(
+                    ["git", "rev-parse", "HEAD"],
+                    capture_output=True, text=True, cwd=workspace_path, timeout=5,
+                )
+                head_sha = git_head_result.stdout.strip()
+                # If HEAD changed from previous_sha, use it; otherwise check if Coder actually made changes
+                if head_sha and head_sha != previous_sha:
+                    new_sha = head_sha
+                else:
+                    return {
+                        "success": False,
+                        "previous_sha": previous_sha,
+                        "new_sha": None,
+                        "error": "Coder did not produce a new commit SHA" + (f" (exit code: {proc.returncode})" if proc.returncode != 0 else ""),
+                        "output_path": output_path,
+                    }
 
             # Verify the commit exists in git log
             r = subprocess.run(
