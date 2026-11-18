@@ -1,0 +1,9 @@
+{
+  "workspace_path": "/tmp/fr_acc_ws_AHqy39",
+  "repo_owner": "caseclub-dev",
+  "repo_name": "hermes-frontier-review-test",
+  "pr_number": 1,
+  "head_branch": "feat/broken-calc",
+  "base_branch": "main",
+  "sha_a_remote": "cd19d767efa9668bf2c4f4b5101641885f2f73ff"
+}
