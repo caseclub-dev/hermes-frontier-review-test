@@ -93,13 +93,23 @@ from frontier_review.budget import record_request, isolate_test_ledger, reset_le
 # ━━━━━━━━━━━━━━━━━━ 1. test_full_pass_first_review ━━━━━━━━━━━━━━━━━━━
 
 def test_full_pass_first_review():
-    """Single PASS from mock transport → READY_FOR_OPERATOR_REVIEW."""
+    """Single PASS from mock transport → READY_FOR_OPERATOR_REVIEW.
+
+    Uses injected mock transport returning PASS deterministically, bypassing
+    the evidence-aware logic for a controlled positive path.
+    """
     tmpdir = _run_test_scenario("full_pass_first")
     try:
         ws_path = _make_workspace(tmpdir, "workspace")
         state_dir = os.path.join(tmpdir, "state")
 
-        # Build a passing evidence-aware review: clean code + passing tests
+        mt = MockAnthropicTransport()
+        mt.configure(MockAnthropicTransport.ok_response(
+            status="pass",
+            summary="All requirements met. Code is ready for operator review.",
+            findings=[],
+        ))
+
         loop = AutonomousCorrectionLoop(
             workspace_path=ws_path,
             state_dir=state_dir,
@@ -112,25 +122,12 @@ def test_full_pass_first_review():
             task_id=f"pass-first-{tmpdir[-6:]}",
             requirements="Function must handle division safely.",
             acceptance_criteria=["Division is guarded", "Error handling present"],
-            code_context="Simple utility module.",
-            # No mock_transport → uses evidence-aware internal logic.
-            # But we need a diff and test_evidence that passes.
+            mock_transport=mt,
             initial_commit_sha="a" * 40,
         )
 
-        # Since we're using evidence-aware mode without transport,
-        # we need a diff/evidence combo that results in PASS.
-        # The _build_evidence_aware_review_payload will check:
-        # - No type hint removals (diff has no "-" lines with type hints)
-        # - No syntax errors
-        # - No off-by-one
-        # - Test evidence shows passing
-        # - All acceptance criteria met
-
-        assert result.task_record.final_disposition in (
-            Disposition.READY_FOR_OPERATOR_REVIEW,
-            Disposition.CHANGES_REQUIRED,
-        ), f"Unexpected disposition: {result.task_record.final_disposition}"
+        assert result.task_record.final_disposition == Disposition.READY_FOR_OPERATOR_REVIEW, \
+            f"Expected READY_FOR_OPERATOR_REVIEW but got {result.task_record.final_disposition}"
     finally:
         _cleanup(tmpdir)
 

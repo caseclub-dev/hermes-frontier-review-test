@@ -742,7 +742,22 @@ class AutonomousCorrectionLoop:
                 for kw in ["pass", "fail", "bug", "defect"]
             )
             if not has_quality_keywords:
-                # Acceptance criteria are high-level; no content to verify → accept
+                # Without a diff to inspect, we can only pass if test evidence
+                # confirms the requirements. Empty evidence → inconclusive.
+                has_test_pass_signal = any(
+                    kw in test_evidence.lower()
+                    for kw in ["passed", "assert", "ok", "test passed", "success"]
+                )
+                if not has_test_pass_signal:
+                    return {
+                        "status": "needs_evidence",
+                        "summary": "No code diff and no passing test evidence — review inconclusive.",
+                        "findings": [],
+                        "requirements_met": requirements_met,
+                        "blockers": [],
+                        "suggestions": ["Provide implementation and test results for review."],
+                    }
+                # Acceptance criteria are high-level; confirmed by tests → accept
                 return {
                     "status": "pass",
                     "summary": "All acceptance criteria verified against provided code.",
