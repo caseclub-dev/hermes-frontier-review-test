@@ -458,6 +458,168 @@ class GitHubClient:
         """Get PR info dict from mock state (for testing)."""
         return self._mock_state.get("prs", {}).get(pr_number)
 
+    def get_pr_state_from_api(self, pr_number: int) -> Optional[dict]:
+        """Get PR state from real GitHub API. Returns dict with 'state', 'draft' keys.
+
+        In mock mode (no token / no repo credentials), returns None so callers
+        can fall back to local checks.
+        """
+        if not self.token or not self.repo_owner or not self.repo_name:
+            return None
+        try:
+            from urllib.request import Request, urlopen
+            headers = {
+                "Authorization": f"Bearer {self.token}",
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "Hermes-Phase3D",
+            }
+            req = Request(
+                f"https://api.github.com/repos/{self.repo_owner}/{self.repo_name}/pulls/{pr_number}",
+                headers=headers,
+            )
+            with urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read())
+            return {"state": data.get("state"), "draft": data.get("draft", True)}
+        except Exception:
+            return None
+
+
+# ── Phase 3D helpers ────────────────────────────────────────────────────────────
+
+
+def push_correction_to_github(
+    repo_owner: str,
+    repo_name: str,
+    head_branch: str,
+    token: str,
+) -> tuple[bool, str]:
+    """Push the local feature branch to GitHub and return (success, remote_sha).
+
+    Returns:
+        (True, sha) on success — remote HEAD matches what was pushed.
+        (False, error_msg) on failure.
+
+    Never force-push. Uses standard git push.
+    Requires: git remote 'origin' pointing at the correct repo must be configured.
+    """
+    import os as _os
+
+    # Step 1: Verify we are on the expected branch
+    r = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True, text=True, timeout=5,
+    )
+    if r.stdout.strip() != head_branch:
+        return False, f"Expected branch {head_branch}, got {r.stdout.strip()}"
+
+    # Step 2: Get local HEAD SHA before push
+    r_local = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        capture_output=True, text=True, timeout=5,
+    )
+    local_sha = r_local.stdout.strip()
+
+    # Step 3: Push (no force)
+    _env = {_os.environ.pop(k, "") for k in ("GIT_TERMINAL_PROMPT",)}
+    try:
+        _env2 = _os.environ.copy()
+        _env2["GIT_TERMINAL_PROMPT"] = "0"
+        url = f"https://{token}@github.com/{repo_owner}/{repo_name}.git"
+        r_push = subprocess.run(
+            ["git", "push", "origin", f"{head_branch}:{head_branch}"],
+            capture_output=True, text=True, timeout=120,
+            env=_env2,
+        )
+    finally:
+        pass  # _env cleanup not needed since we used a copy
+
+    if r_push.returncode != 0:
+        return False, f"git push failed: {r_push.stderr[:300]}"
+
+    # Step 4: Verify remote SHA matches local (requirement 6)
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "Hermes-Phase3D",
+    }
+    from urllib.request import Request, urlopen as _urlopen
+    req = Request(
+        f"https://api.github.com/repos/{repo_owner}/{repo_name}/git/refs/heads/{head_branch}",
+        headers=headers,
+    )
+    try:
+        with _urlopen(req, timeout=15) as resp:
+            remote_data = json.loads(resp.read())
+        remote_sha = remote_data.get("object", {}).get("sha", "")
+    except Exception as exc:
+        return False, f"Failed to fetch remote SHA after push: {exc}"
+
+    if remote_sha != local_sha:
+        # Remote HEAD differs from what we just pushed — stale or concurrent update
+        return False, (f"Remote SHA mismatch: local={local_sha[:8]}, "
+                       f"remote={remote_sha[:8]}")
+
+    return True, remote_sha
+
+
+def verify_approval_prerequisites(
+    repo_owner: str,
+    repo_name: str,
+    pr_number: int,
+    head_branch: str,
+    reviewed_sha: str,
+    token: str,
+) -> tuple[bool, str]:
+    """Verify all conditions before marking a PR as ready for operator review.
+
+    Returns (True, '') if all checks pass, or (False, reason).
+    Checks:
+      1. PR is open and assigned to correct repo
+      2. Remote HEAD SHA matches reviewed SHA
+    """
+    # Check 1 & 2: Remote HEAD SHA must match reviewed SHA
+    if not token or not repo_owner or not repo_name:
+        return False, "Missing credentials for verification"
+
+    from urllib.request import Request as _Req, urlopen as _urlopen
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "Hermes-Phase3D",
+    }
+
+    # Get PR state
+    req = _Req(
+        f"https://api.github.com/repos/{repo_owner}/{repo_name}/pulls/{pr_number}",
+        headers=headers,
+    )
+    try:
+        with _urlopen(req, timeout=15) as resp:
+            pr_data = json.loads(resp.read())
+    except Exception as exc:
+        return False, f"GitHub API call failed: {exc}"
+
+    if pr_data.get("state") != "open":
+        return False, f"PR is {pr_data.get('state', 'unknown')}, not open — cannot approve"
+
+    # Get remote HEAD SHA
+    req2 = _Req(
+        f"https://api.github.com/repos/{repo_owner}/{repo_name}/git/refs/heads/{head_branch}",
+        headers=headers,
+    )
+    try:
+        with _urlopen(req2, timeout=15) as resp:
+            head_data = json.loads(resp.read())
+        remote_sha = head_data.get("object", {}).get("sha", "")
+    except Exception as exc:
+        return False, f"Failed to get branch SHA: {exc}"
+
+    if remote_sha != reviewed_sha:
+        return False, (f"Remote HEAD mismatch: reviewed={reviewed_sha[:8]}, "
+                       f"current remote={remote_sha[:8]}")
+
+    return True, ""
+
 
 # ── Discovery ─────────────────────────────────────────────────────────────
 
@@ -530,11 +692,27 @@ def discover_reviewable_prs(
             logger.warning(f"No remote SHA found for {task.task_id}")
             continue
 
-        # Check PR open state via mock or real API
+        # Check PR open state — try mock first, then real GitHub API (Blocker 2)
         pr_info = client.get_pr_state(task.pr_number) if hasattr(client, 'get_pr_state') else None
         is_open = True  # default assumption; only checked in mock mode
         if pr_info:
             is_open = pr_info.get("is_open", True)
+
+        # Also check via real GitHub API for Blocker 2 (closed/merged PR filtering)
+        api_state = client.get_pr_state_from_api(task.pr_number)
+        if api_state and api_state.get("state") != "open":
+            # Closed or merged — skip entirely, mark stale in ledger
+            logger.info(
+                f"PR #{task.pr_number} is {api_state['state']} — skipping (API check)"
+            )
+            try:
+                raw = registry._ledger._data[task.task_id]
+                raw["review_status"] = "skipped"
+                raw["updated_at"] = datetime.now(timezone.utc).isoformat()
+                registry._ledger._save()
+            except Exception:
+                pass
+            continue
 
         if not is_open:
             logger.info(f"PR #{task.pr_number} closed/merged — skipping")
