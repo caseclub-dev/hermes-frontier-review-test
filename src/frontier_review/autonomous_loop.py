@@ -735,16 +735,26 @@ class AutonomousCorrectionLoop:
                     "suggestions": ["Consider adding docstrings for production readiness."],
                 }
 
-        # Fallback: if no issues were detected in code content and we have a diff,
-        # treat it as PASS — the evidence-aware inspection verified quality
+        # Fallback: no issues in code content — but require passing test signal
+        # before granting PASS. Without evidence the review is inconclusive.
         if not issues and diff and diff.strip():
+            if test_passed or (acceptance_criteria and all_criteria_met):
+                return {
+                    "status": "pass",
+                    "summary": "All requirements met. Code is ready for operator review.",
+                    "findings": [],
+                    "requirements_met": requirements_met or acceptance_criteria,
+                    "blockers": [],
+                    "suggestions": ["Consider adding docstrings for production readiness."],
+                }
+            # Inconclusive: clean diff but no passing test evidence → NEEDS_EVIDENCE
             return {
-                "status": "pass",
-                "summary": "All requirements met. Code is ready for operator review.",
+                "status": "needs_evidence",
+                "summary": "Review inconclusive — no passing test evidence found.",
                 "findings": [],
-                "requirements_met": requirements_met or acceptance_criteria,
+                "requirements_met": requirements_met,
                 "blockers": [],
-                "suggestions": ["Consider adding docstrings for production readiness."],
+                "suggestions": ["Run tests and provide test output as evidence."],
             }
 
         # Fallback: no clear signal → NEEDS_EVIDENCE

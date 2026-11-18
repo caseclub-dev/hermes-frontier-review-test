@@ -1298,5 +1298,59 @@ def test_autonomous_loop_initialization_defaults():
         _cleanup(tmpdir)
 
 
+# ━━━━━━━━ 28. test_no_pass_without_test_evidence ━━━━━━━━━━━━━━━━━━
+
+def test_no_pass_without_test_evidence():
+    """A clean diff with no passing test evidence must NOT auto-pass.
+
+    Regression test for M4C Issue 1: an evidence-aware review should not
+    return PASS when the diff is defect-free but no test evidence has been
+    provided to corroborate the code quality claim.
+    """
+    tmpdir = _run_test_scenario("no_pass_no_evidence")
+    try:
+        ws_path = _make_workspace(tmpdir, "workspace")
+        state_dir = os.path.join(tmpdir, "state")
+
+        loop = AutonomousCorrectionLoop(
+            workspace_path=ws_path,
+            state_dir=state_dir,
+            max_corrections=3,
+            max_reviews=4,
+            cost_ceiling_usd=10.0,
+        )
+
+        # Code that correctly handles division by zero (no defects)
+        good_diff = """--- a/main.py
++++ b/main.py
+@@ -1,2 +1,5 @@
+-def divide(a, b):
+-    return a / b
++def divide(a: float, b: float) -> float:
++    if b == 0:
++        raise ValueError('zero')
++    return a / b
+"""
+
+        # Clean diff but NO test evidence and acceptance criteria present
+        result = loop._build_evidence_aware_review_payload(
+            requirements="Division function must guard zero.",
+            diff=good_diff,
+            test_evidence="",  # <-- No passing test signal
+            acceptance_criteria=["Handles zero correctly"],
+        )
+
+        assert result["status"] != "pass", (
+            f"Clean diff without test evidence must not auto-pass; "
+            f"got {result['status']}"
+        )
+        assert result["status"] == "needs_evidence", (
+            f"Expected NEEDS_EVIDENCE, got {result['status']}"
+        )
+
+    finally:
+        _cleanup(tmpdir)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=short"])

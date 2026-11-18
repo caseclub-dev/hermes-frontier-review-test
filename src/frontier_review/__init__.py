@@ -61,6 +61,11 @@ from .autonomous_loop import (  # noqa: E402
     AutonomousCorrectionLoop, TaskRecord, WorkflowState, Disposition,
 )
 from .workflow_state import WorkflowLedger  # noqa: E402
+from .remote_delegator import (  # noqa: E402
+    FrontierReviewDelegator,
+    create_demo_workspace,
+    run_full_m4b_pipeline,
+)
 
 __all__ = [
     "ALLOWED_MODEL",
@@ -109,4 +114,8 @@ __all__ = [
     "WorkflowState",
     "Disposition",
     "WorkflowLedger",
+    # M4C — remote delegator bridge
+    "FrontierReviewDelegator",
+    "create_demo_workspace",
+    "run_full_m4b_pipeline",
 ]
