@@ -11,6 +11,7 @@ import fcntl
 import hashlib
 import json
 import os
+import subprocess
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
@@ -102,6 +103,7 @@ class WorkflowLedger:
         """Load ledger from disk."""
         try:
             with open(self._path) as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_SH)
                 raw = json.load(f)
             if isinstance(raw, dict):
                 self._data = raw
@@ -110,17 +112,91 @@ class WorkflowLedger:
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             self._data = {}
 
+    def _load_under_lock(self, task_id: Optional[str] = None) -> None:
+        """Reload ledger state from disk under a shared lock.
+
+        If *task_id* is provided, reloads only that task's entry; otherwise
+        reloads the entire ledger into self._data.  Uses ``fcntl.LOCK_SH``
+        for cross-process safety so concurrent readers are not blocked.
+
+        Args:
+            task_id: Optional task identifier to reload selectively.
+        """
+        try:
+            with open(self._path) as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+                raw = json.load(f)
+            if not isinstance(raw, dict):
+                raw = {}
+            if task_id is not None:
+                # Reload only this task's entry; preserve others in memory
+                if task_id in raw:
+                    self._data[task_id] = raw[task_id]
+                # else: leave existing in-memory data untouched
+            else:
+                self._data = raw
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            if task_id is not None:
+                # Best-effort: don't wipe the entire ledger on a partial read error
+                pass
+            else:
+                self._data = {}
+
+    def _extend_lease(self, task_id: str, ttl_seconds: int = 300) -> bool:
+        """Renew the claim_expires_at for an IN_PROGRESS task.
+
+        Uses an exclusive lock (``fcntl.LOCK_EX``) to atomically read-modify-write
+        only the target task's timestamp fields.
+
+        Args:
+            task_id: The task whose lease to extend.
+            ttl_seconds: Number of seconds to add to the current expiry.
+
+        Returns:
+            True if the lease was renewed, False if the task is not IN_PROGRESS
+            or does not exist.
+        """
+        try:
+            with open(self._path) as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                raw = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return False
+
+        if task_id not in raw:
+            return False
+
+        rec = TaskRecord.from_dict(raw[task_id])
+        if rec.status != "IN_PROGRESS":
+            return False
+
+        now = datetime.now(timezone.utc)
+        try:
+            expires = datetime.fromisoformat(rec.claim_expires_at)
+        except (ValueError, TypeError):
+            expires = now
+        new_expiry = expires + timedelta(seconds=ttl_seconds)
+
+        raw[task_id]["claim_expires_at"] = new_expiry.isoformat()
+        raw[task_id]["updated_at"] = now.isoformat()
+
+        # Update in-memory state for same-process callers
+        self._data[task_id] = raw[task_id]
+
+        try:
+            self._atomic_write(raw)
+        except OSError:
+            pass  # In-memory data is already updated; disk write failure is non-fatal
+
+        return True
+
     def _save(self) -> None:
         """Persist ledger to disk atomically (write tmp then replace)."""
-        try:
-            tmp_path = self._path + ".tmp"
-            with open(tmp_path, "w") as f:
-                json.dump(self._data, f, indent=2, default=str)
-            os.replace(tmp_path, self._path)
-        except OSError:
-            # Fallback: direct write (shouldn't fail in practice)
-            with open(self._path, "w") as f:
-                json.dump(self._data, f, indent=2, default=str)
+        with open(self._path, "w") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            json.dump(self._data, f, indent=2, default=str)
+            f.flush()
+            os.fsync(f.fileno())
 
     def create_task(
         self,
@@ -144,9 +220,21 @@ class WorkflowLedger:
         Returns:
             The newly created TaskRecord.
         """
+        # Hardened locking: reload from disk before any mutation
+        self._load_under_lock(task_id)
         if task_id in self._data:
             # Idempotent: return existing record (concurrent callers may overlap)
             return TaskRecord.from_dict(self._data[task_id])
+
+        # Auto-detect git HEAD when workspace_path points to a git repo
+        # and no explicit original_sha was provided.
+        if not original_sha and os.path.isdir(workspace_path):
+            r = subprocess.run(
+                ["git", "rev-parse", "HEAD"], capture_output=True, text=True,
+                cwd=workspace_path, timeout=5,
+            )
+            if r.returncode == 0:
+                original_sha = r.stdout.strip()
 
         now = datetime.now(timezone.utc).isoformat()
         record = TaskRecord(
@@ -197,6 +285,8 @@ class WorkflowLedger:
             diff: Git diff of the correction.
             test_output: Test evidence output.
         """
+        # Hardened locking: reload from disk before any mutation
+        self._load_under_lock(task_id)
         if task_id not in self._data:
             raise ValueError(f"Task '{task_id}' not found for correction recording")
 
@@ -224,6 +314,8 @@ class WorkflowLedger:
         Args:
             task_id: The task whose correction count to increment.
         """
+        # Hardened locking: reload from disk before any mutation
+        self._load_under_lock(task_id)
         if task_id not in self._data:
             raise ValueError(f"Task '{task_id}' not found for correction count")
         rec = self._data[task_id]
@@ -255,6 +347,8 @@ class WorkflowLedger:
             True if the review was recorded, False if it would be a
             duplicate (same SHA + evidence fingerprint and already recorded).
         """
+        # Hardened locking: reload from disk before any mutation
+        self._load_under_lock(task_id)
         if task_id not in self._data:
             raise ValueError(f"Task '{task_id}' not found for review recording")
 
@@ -372,6 +466,8 @@ class WorkflowLedger:
         Returns:
             The finalized TaskRecord.
         """
+        # Hardened locking: reload from disk before any mutation
+        self._load_under_lock(task_id)
         rec = self.get_task(task_id)
         rec_data = self._data[task_id]
         rec_data["final_disposition"] = disposition
@@ -435,10 +531,22 @@ class WorkflowLedger:
             )
 
         now = datetime.now(timezone.utc).isoformat()
+        # Auto-detect git HEAD when workspace_path points to a git repo.
+        initial_sha = ""
+        if os.path.isdir(workspace_path):
+            r = subprocess.run(
+                ["git", "rev-parse", "HEAD"], capture_output=True, text=True,
+                cwd=workspace_path, timeout=5,
+            )
+            if r.returncode == 0:
+                initial_sha = r.stdout.strip()
+
         record = TaskRecord(
             task_id=task_id,
             requirements=requirements,
             workspace_path=workspace_path,
+            original_sha=initial_sha,
+            current_sha=initial_sha,
             created_at=now,
             updated_at=now,
             status="PENDING_REVIEW",

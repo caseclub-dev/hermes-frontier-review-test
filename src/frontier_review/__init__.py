@@ -61,6 +61,7 @@ from .autonomous_loop import (  # noqa: E402
     AutonomousCorrectionLoop, TaskRecord, WorkflowState, Disposition,
 )
 from .workflow_state import WorkflowLedger  # noqa: E402
+from .completion_adapter import CoderCompletionAdapter  # noqa: E402
 from .remote_delegator import (  # noqa: E402
     FrontierReviewDelegator,
     create_demo_workspace,
@@ -114,6 +115,8 @@ __all__ = [
     "WorkflowState",
     "Disposition",
     "WorkflowLedger",
+    # Phase 2 — completion adapter
+    "CoderCompletionAdapter",
     # M4C — remote delegator bridge
     "FrontierReviewDelegator",
     "create_demo_workspace",

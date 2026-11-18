@@ -27,6 +27,7 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -151,7 +152,8 @@ class AutonomousCorrectionLoop:
 
         On first call, stores initial_commit_sha as fallback. On subsequent calls
         within the same loop iteration, reads the latest current_sha from the ledger
-        to pick up any correction-committed changes.
+        to pick up any correction-committed changes.  If both ledger fields are empty
+        and the workspace is a git repo, falls back to *git rev-parse HEAD*.
 
         Args:
             task_id: The task whose SHA to sync.
@@ -163,7 +165,15 @@ class AutonomousCorrectionLoop:
         if not self._initial_commit_sha:
             try:
                 rec = self.ledger.get_task(task_id)
-                self._initial_commit_sha = rec.current_sha or rec.original_sha
+                sha = rec.current_sha or rec.original_sha
+                if not sha and os.path.isdir(self.workspace_path):
+                    r = subprocess.run(
+                        ["git", "rev-parse", "HEAD"], capture_output=True, text=True,
+                        cwd=self.workspace_path, timeout=5,
+                    )
+                    if r.returncode == 0:
+                        sha = r.stdout.strip()
+                self._initial_commit_sha = sha
             except ValueError:
                 pass
 
