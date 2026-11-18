@@ -258,6 +258,12 @@ class TestFailureHandling:
         assert r["status"] == "blocked"
         assert r["terminal"] is True
 
+    def test_malformed_review_without_details(self):
+        r = handle_delegation_failure("malformed_review", None)
+        assert r["status"] == "blocked"
+        assert r["terminal"] is True
+        assert "no details" in r["summary"]
+
     def test_max_cycles_exhausted_esc_always(self):
         r = handle_delegation_failure("max_cycles_exhausted")
         assert r["status"] == "escalated_architect"

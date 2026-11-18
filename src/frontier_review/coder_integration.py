@@ -600,7 +600,7 @@ def handle_delegation_failure(
             "status": "changes_required",
             "summary": "Coder returned no commit — correction failed.",
             "findings": [{"title": "No git commit found", "severity": "HIGH",
-                          "category": "evidence", "description": response_text}],
+                          "category": "evidence", "description": response_text or ""}],
             "terminal": False,
         }
     elif error_type == "no_changes":
@@ -608,13 +608,13 @@ def handle_delegation_failure(
             "status": "changes_required",
             "summary": "Coder made no changes — correction was a no-op.",
             "findings": [{"title": "No code changes detected", "severity": "HIGH",
-                          "category": "correctness", "description": response_text}],
+                          "category": "correctness", "description": response_text or ""}],
             "terminal": False,
         }
     elif error_type == "malformed_review":
         return {
             "status": "blocked",
-            "summary": f"Mock review returned malformed data: {response_text[:100]}",
+            "summary": f"Mock review returned malformed data: {response_text[:100] if response_text else 'no details'}",
             "terminal": True,
         }
     elif error_type == "max_cycles_exhausted":
@@ -627,9 +627,9 @@ def handle_delegation_failure(
     elif error_type == "tests_failed":
         return {
             "status": "changes_required",
-            "summary": f"Tests failed after correction: {response_text[:200]}",
+            "summary": f"Tests failed after correction: {response_text[:200] if response_text else 'no details'}",
             "findings": [{"title": "Test failures", "severity": "HIGH",
-                          "category": "correctness", "description": response_text}],
+                          "category": "correctness", "description": response_text or ""}],
             "terminal": False,
         }
     else:
