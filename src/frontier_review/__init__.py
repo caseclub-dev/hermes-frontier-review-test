@@ -23,6 +23,8 @@ Modules
 |- ``delegation_adapter`` – adapter for delegating review feedback to Coder
 |- ``coder_integration``  – M3: real Coder delegation via delegate_task (M3 milestone)
 |- ``orchestrator``  – workflow orchestration with bounded autonomous loop
+|- ``autonomous_loop``   – M4: evidence-aware autonomous correction loop
+|- ``workflow_state``    – durable task-state persistence (WorkflowLedger)
 
 No live API calls are made unless explicitly enabled in a future phase.
 """
@@ -55,6 +57,10 @@ from .coder_integration import (  # noqa: E402
     create_disposable_workspace, MockReviewSimulator, CorrectionLoopRunner,
     handle_delegation_failure, is_duplicate_review, is_max_correction_cycles,
 )
+from .autonomous_loop import (  # noqa: E402
+    AutonomousCorrectionLoop, TaskRecord, WorkflowState, Disposition,
+)
+from .workflow_state import WorkflowLedger  # noqa: E402
 
 __all__ = [
     "ALLOWED_MODEL",
@@ -97,4 +103,10 @@ __all__ = [
     "handle_delegation_failure",
     "is_duplicate_review",
     "is_max_correction_cycles",
+    # M4 — autonomous correction loop
+    "AutonomousCorrectionLoop",
+    "TaskRecord",
+    "WorkflowState",
+    "Disposition",
+    "WorkflowLedger",
 ]
