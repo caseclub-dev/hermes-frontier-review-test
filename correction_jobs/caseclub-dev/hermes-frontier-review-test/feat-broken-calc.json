@@ -1,0 +1,19 @@
+{
+  "version": "1.0",
+  "task_id": "caseclub-dev/hermes-frontier-review-test/feat-broken-calc",
+  "workspace_path": "/tmp/frontier_test_workspace",
+  "current_sha": "168b6e0d7dbcdd1df9babce85e2f004dced2d030",
+  "generated_at": "2026-11-18T23:03:33.371754+00:00",
+  "findings": [
+    {
+      "title": "needs_fixes",
+      "severity": "MEDIUM",
+      "category": "quality",
+      "location": "",
+      "description": "Issues found"
+    }
+  ],
+  "requirements": "The add(a, b) function must correctly return a + b for all integer inputs.",
+  "acceptance_criteria": [],
+  "code_context": ""
+}
