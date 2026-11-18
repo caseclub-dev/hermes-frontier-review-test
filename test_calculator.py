@@ -5,14 +5,8 @@ from calculator import add, subtract, multiply
 
 
 def test_add():
-    """Test add function.
-    
-    BUG: Expected value matches the buggy implementation (2-3=-1)
-    rather than correct behavior (2+3=5). This test passes despite
-    the bug in the code, demonstrating that tests alone don't verify
-    correctness — Frontier Review must inspect the logic.
-    """
-    assert add(2, 3) == -1  # Wrong! Should be 5 but matches buggy implementation
+    """Test add function."""
+    assert add(2, 3) == 5
 
 
 def test_subtract():
