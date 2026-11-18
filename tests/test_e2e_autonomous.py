@@ -306,10 +306,15 @@ def test_evidence_aware_defect_detection():
 
 
 def test_evidence_aware_defect_detection_real_delegation():
-    """Creates a defect in a disposable workspace, delegates to Coder via delegate_task.
+    """Tests evidence-aware defect detection on code with a clear division-by-zero bug.
 
-    This test requires browser_exec / delegate_task capability from Orchestrator context.
-    In automated CI, it uses a mock delegation pattern.
+    Uses the _build_evidence_aware_review_payload method directly to verify that:
+    1. A diff with missing error handling for risky operations is flagged CHANGES_REQUIRED.
+    2. The finding specifically mentions the defect (division by zero, no guard).
+    3. An acceptance criterion about zero-division is correctly evaluated as UNSATISFIED.
+
+    In an Orchestrator context, the same evidence could be submitted via delegate_task
+    for real Coder correction, then re-reviewed after the correction is committed.
     """
     tmpdir = _run_test_scenario("evident_defect_real")
     try:
