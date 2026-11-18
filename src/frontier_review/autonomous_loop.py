@@ -531,7 +531,28 @@ class AutonomousCorrectionLoop:
         for line in diff.split("\n"):
             stripped = line.strip()
             # Match function defs that lack type annotations (no -> and no : param types)
-            if re.match(r"(?:\+|-)?\s*def\s+\w+\s*\([^)]*\)\s*(?!\s*->)", stripped):
+            match = re.match(r"(?:\+|-)?\s*def\s+(\w+)\s*\([^)]*\)\s*(?!\s*->)", stripped)
+            if match:
+                func_name = match.group(1)
+                # Skip test functions (pytest convention): test_*, _test, fixture_*, setup/teardown
+                if func_name.startswith("test_") or func_name.endswith("_test"):
+                    continue
+                if func_name.startswith("fixture_") or func_name in (
+                    "setup_module", "setup_class", "setup_function",
+                    "teardown_module", "teardown_class", "teardown_function",
+                    "setUp", "tearDown",
+                ):
+                    continue
+                # Check if the function is inside a test class context
+                # Look back in diff for "class Test" or "class test" marker
+                prev_lines = diff.split("\n")[:diff.split("\n").index(line)]
+                in_test_context = any(
+                    re.search(r"class\s+Test\w*\s*[:\(]", pl.strip()) or
+                    re.search(r"class\s+test\w*\s*[:\(]", pl.strip())
+                    for pl in reversed(prev_lines)
+                )
+                if in_test_context:
+                    continue
                 # Function def without return type hint — check if it's an addition or context line
                 if "+" in stripped or not stripped.startswith("-"):
                     has_no_type_hints_on_def = True
