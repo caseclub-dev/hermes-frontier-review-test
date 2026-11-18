@@ -354,20 +354,66 @@ class GitHubClient:
         """Get the current HEAD SHA of a PR's feature branch on GitHub.
 
         In mock mode, looks up from _mock_state["branch_shas"].
+        Falls back to real GitHub API when called with repo credentials
+        and no matching mock state.
         """
         if self._mock_state.get("api_error"):
             raise ConnectionError(
                 f"GitHub API connection error for {self.repo_owner}/{self.repo_name}"
             )
-        return self._mock_state.get("branch_shas", {}).get(head_branch, "")
+        branch_shas = self._mock_state.get("branch_shas", {})
+        if head_branch in branch_shas:
+            return branch_shas[head_branch]
+        # Real GitHub API fallback for integration testing
+        if self.token and self.repo_owner and self.repo_name:
+            try:
+                from urllib.request import Request, urlopen
+                headers = {
+                    "Authorization": f"Bearer {self.token}",
+                    "Accept": "application/vnd.github+json",
+                    "User-Agent": "Hermes-Phase3D",
+                }
+                req = Request(
+                    f"https://api.github.com/repos/{self.repo_owner}/{self.repo_name}/git/refs/heads/{head_branch}",
+                    headers=headers,
+                )
+                with urlopen(req, timeout=15) as resp:
+                    data = json.load(resp)
+                return data.get("object", {}).get("sha", "")
+            except Exception:
+                pass
+        return ""
 
     def get_pr_diff(self, pr_number: int, base_branch: str) -> str:
         """Get the full unified diff for a PR against its base branch.
 
         This is what gets passed to Frontier Review as code context.
         The controller extracts this and builds review payloads — NOT the model.
+
+        Falls back to real GitHub API when called with repo credentials
+        and no matching mock state.
         """
-        return self._mock_state.get("diffs", {}).get(pr_number, "")
+        diffs = self._mock_state.get("diffs", {})
+        if pr_number in diffs:
+            return diffs[pr_number]
+        # Real GitHub API fallback for integration testing
+        if self.token and self.repo_owner and self.repo_name:
+            try:
+                from urllib.request import Request, urlopen
+                headers = {
+                    "Authorization": f"Bearer {self.token}",
+                    "Accept": "application/vnd.github.v3.diff",
+                    "User-Agent": "Hermes-Phase3D",
+                }
+                req = Request(
+                    f"https://api.github.com/repos/{self.repo_owner}/{self.repo_name}/pulls/{pr_number}/diff",
+                    headers=headers,
+                )
+                with urlopen(req, timeout=15) as resp:
+                    return resp.read().decode()
+            except Exception:
+                pass
+        return ""
 
     def update_status(
         self, ref_sha: str, state: str, description: str, context: str = ""

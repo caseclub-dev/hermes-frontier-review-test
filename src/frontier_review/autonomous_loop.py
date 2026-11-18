@@ -220,6 +220,7 @@ class AutonomousCorrectionLoop:
         code_context: str = "",
         mock_transport: Optional[MockAnthropicTransport] = None,
         initial_commit_sha: str = "0" * 40,
+        pr_mode: bool = False,
     ) -> WorkflowState:
         """Execute the full autonomous correction loop.
 
@@ -426,11 +427,12 @@ class AutonomousCorrectionLoop:
                 return ws
 
             # Phase 3B: If using mock transport (test mode), auto-correct internally
-            # and continue the loop. For real Coder dispatch (production), write a job
-            # file, transition to CORRECTION_PENDING, and exit for external invocation.
+            # and continue the loop. For real Coder dispatch (production/PR mode),
+            # write a job file, transition to CORRECTION_PENDING, and exit for
+            # external invocation. When pr_mode=True, always dispatch externally.
             _using_mock = getattr(self.client, "transport", None) is not None
 
-            if _using_mock:
+            if _using_mock and not pr_mode:
                 # ── Auto-correct in-place for backward-compatible test loops ──
                 new_sha = self._apply_mock_correction(
                     task_id=task_id,
@@ -441,6 +443,9 @@ class AutonomousCorrectionLoop:
                 )
                 if new_sha and new_sha != current_sha:
                     self.ledger.update_task_sha(task_id, new_sha)
+                    # Increment correction count so next review isn't blocked as
+                    # a duplicate (existing_reviews populated, but code has changed).
+                    self.ledger.increment_correction_count(task_id)
                 # Loop continues; next iteration calls _run_single_review again
                 continue
 
@@ -503,8 +508,12 @@ class AutonomousCorrectionLoop:
         Returns:
             ReviewResult with status and findings.
         """
-        # Build evidence-aware review payload (for non-transport mode)
-        if mock_transport is None or not self.client.transport:
+        # Use injected mock transport if client was configured with one,
+        # otherwise fall back to evidence-aware pipeline.
+        # BUG FIX (Phase 3D): Previously, `mock_transport is None` short-circuited
+        # here even when self.client.transport was set via _init_client_with_transport(),
+        # causing the mock transport to be ignored and the evidence-aware path used instead.
+        if not self.client.transport:
             payload = self._build_evidence_aware_review_payload(
                 requirements=requirements,
                 diff=diff,
@@ -1041,6 +1050,7 @@ class AutonomousCorrectionLoop:
         marker_dir = os.path.join(workspace_path, "correction_jobs")
         os.makedirs(marker_dir, exist_ok=True)
         marker_path = os.path.join(marker_dir, f"{task_id}.corrected")
+        os.makedirs(os.path.dirname(marker_path), exist_ok=True)
         with open(marker_path, "w") as f:
             json.dump({
                 "version": "1.0",
@@ -1172,6 +1182,7 @@ class AutonomousCorrectionLoop:
         output_path = os.path.join(
             self.state_dir, f"correction_output_{task_id}.txt"
         )
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
         try:
             with open(output_path, "w") as outf:
                 proc = subprocess.run(
