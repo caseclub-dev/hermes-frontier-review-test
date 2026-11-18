@@ -19,6 +19,7 @@ cost ceiling enforcement, duplicate-review prevention via evidence fingerprints.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import subprocess
@@ -28,6 +29,8 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 
 # ── Delegation request builder (enhanced from coder_integration) ────
@@ -484,6 +487,33 @@ class RealCorrectionLoop:
             review_sequence.append(review_entry)
 
             if review_payload["status"] == "pass":
+                # ── Final approval gate (in-memory variant) ───────────
+                # Validate that the in-memory review sequence contains a
+                # legitimate PASS entry with sha before approving.
+                pass_reviews = [r for r in review_sequence if r.get("status") == "pass"]
+                latest_pass = pass_reviews[-1] if pass_reviews else {}
+                last_sha = verifier.get_last_commit_sha() or ""
+
+                if not latest_pass:
+                    final_disposition = "blocked"
+                    logger.warning(
+                        f"[{task_id_with_prefix}] Approval gate blocked: "
+                        "No PASS review record found in sequence"
+                    )
+                    break
+                if not latest_pass.get("sha"):
+                    final_disposition = "blocked"
+                    logger.warning(
+                        f"[{task_id_with_prefix}] Approval gate blocked: "
+                        "PASS review has no commit SHA"
+                    )
+                    break
+
+                # Advisory only — this pipeline has no durable ledger.
+                # The check above prevents returning READY for tasks with
+                # zero reviews or missing SHA.  It does not provide the same
+                # cross-verification as the ledger-based gate in
+                # AutonomousCorrectionLoop.
                 final_disposition = "ready_for_operator_review"
                 break
 

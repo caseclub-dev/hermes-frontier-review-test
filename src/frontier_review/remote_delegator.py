@@ -25,6 +25,7 @@ inspection via ``AutonomousCorrectionLoop._build_evidence_aware_review_payload``
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import sys
@@ -43,6 +44,9 @@ from frontier_review.m4b_integration import (  # noqa: E402
     RealCoderDelegator,
     GitWorkspaceVerifier,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 # ── FrontierReviewDelegator — bridges delegate_task → Coder ──────────
@@ -296,6 +300,19 @@ def run_full_m4b_pipeline(
     current_sha = verifier.get_last_commit_sha() or ""
 
     if initial_review["status"] == "pass":
+        # ── Final approval gate (remote_delegator variant) ────
+        # Lightweight check: ensure review_sequence has a PASS entry
+        # with sha.  No durable ledger — advisory only.
+        pass_entries = [r for r in review_sequence if r.get("status") == "pass"]
+        if not pass_entries or not pass_entries[-1].get("sha"):
+            return {
+                "final_disposition": "blocked",
+                "review_sequence": review_sequence,
+                "workspace_path": ws,
+                "corrections_made": 0,
+                "reviews_run": 1,
+            }
+
         return {
             "final_disposition": "ready_for_operator_review",
             "review_sequence": review_sequence,
@@ -371,9 +388,15 @@ def run_full_m4b_pipeline(
         "timestamp": datetime.now(timezone.utc).isoformat(),
     })
 
-    disposition = (
-        "ready_for_operator_review" if post_review["status"] == "pass" else "max_correction_exhausted"
-    )
+    # ── Final approval gate (post-correction variant) ───────
+    if post_review["status"] == "pass":
+        pass_entries = [r for r in review_sequence if r.get("status") == "pass"]
+        if not pass_entries or not pass_entries[-1].get("sha"):
+            disposition = "blocked"
+        else:
+            disposition = "ready_for_operator_review"
+    else:
+        disposition = "max_correction_exhausted"
 
     return {
         "final_disposition": disposition,

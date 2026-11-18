@@ -399,6 +399,132 @@ class WorkflowLedger:
             rec.get("total_mock_cost_usd", 0.0) for rec in self._data.values()
         )
 
+    def validate_approval_record(
+        self,
+        task_id: str,
+        workspace_path: str,
+        commit_sha: str,
+        test_evidence: str = "",
+    ) -> dict[str, Any]:
+        """Validate that an existing review record authorizes final approval.
+
+        This is the mandatory gate before any task may transition to
+        READY_FOR_OPERATOR_REVIEW.  It verifies that a **legitimate**
+        review record — one produced by the normal workflow (not
+        fabricated post-hoc) — exists in this ledger and matches all
+        required fields.
+
+        Checks:
+          1. Task record exists for *task_id*.
+          2. At least one review with status ``"pass"`` is recorded.
+          3. The latest PASS review has a matching *workspace_path*.
+          4. The latest PASS review references the expected *commit_sha*.
+          5. The evidence fingerprint is consistent (non-empty for
+             tasks that had test evidence, empty-only when no tests ran).
+          6. Status is exactly ``"pass"`` — never ``"changes_required"``,
+             ``"blocked"``, or anything else.
+
+        Args:
+            task_id: The task whose review record to validate.
+            workspace_path: Canonical repository / workspace path.
+            commit_sha: Exact final Git commit SHA to match.
+            test_evidence: Test output (for fingerprint matching).
+
+        Returns:
+            Dict with keys:
+              ``approved`` (bool): True only if ALL checks pass.
+              ``reason`` (str): Human-readable reason if not approved.
+              ``status`` (str | None): Status of the latest review entry.
+              ``findings`` (list[dict]): Findings from the latest PASS review.
+
+        Raises:
+            ValueError: If *task_id* does not exist in this ledger.
+        """
+        rec = self.get_task(task_id)
+        # rec is a TaskRecord dataclass; access fields directly
+        workspace = rec.workspace_path
+        current_sha = rec.current_sha
+        reviews = [e for e in rec.review_sequence if isinstance(e, dict) and e.get("type") == "review"]
+
+        # 1. Must have at least one review
+        if not reviews:
+            return {
+                "approved": False,
+                "reason": "No review record found for this task",
+                "status": None,
+                "findings": [],
+            }
+
+        # Find the latest PASS review (if any) — check from most recent
+        # ReviewStatus.PASS.value == "PASS" (uppercase)
+        pass_reviews = [r for r in reviews if r.get("status") == "PASS"]
+
+        if not pass_reviews:
+            latest = reviews[-1]
+            return {
+                "approved": False,
+                "reason": f"Latest review status is '{latest.get('status')}' — not PASS",
+                "status": latest.get("status"),
+                "findings": latest.get("findings", []),
+            }
+
+        # Use the latest PASS review
+        latest_pass = pass_reviews[-1]
+        review_sha = latest_pass.get("sha", "")
+        review_fp = latest_pass.get("evidence_fp", "")
+        review_status = latest_pass.get("status", "")
+        findings = latest_pass.get("findings", [])
+
+        # 2. Workspace path must match
+        if workspace and workspace_path and workspace != workspace_path:
+            return {
+                "approved": False,
+                "reason": f"Workspace mismatch: ledger={workspace!r}, expected={workspace_path!r}",
+                "status": review_status,
+                "findings": findings,
+            }
+
+        # 3. The PASS review was performed on a specific commit (review_sha).
+        #    It must match the expected commit. This prevents approving old
+        #    reviews after code changes that update ledger.current_sha
+        #    without requiring re-review.
+        if review_sha and commit_sha and review_sha != commit_sha:
+            return {
+                "approved": False,
+                "reason": f"SHA mismatch: PASS review on={review_sha!r}, expected={commit_sha!r}",
+                "status": review_status,
+                "findings": findings,
+            }
+
+        # 4. Evidence fingerprint consistency — a PASS with empty evidence_fp
+        #    is acceptable only when no test evidence was provided; a non-empty
+        #    evidence_fp requires matching test evidence
+        if test_evidence and not review_fp:
+            return {
+                "approved": False,
+                "reason": "Test evidence provided but no evidence fingerprint in review record",
+                "status": review_status,
+                "findings": findings,
+            }
+
+        if test_evidence and review_fp:
+            expected_fp = self.compute_fingerprint(review_sha or commit_sha, test_evidence)
+            if review_fp != expected_fp:
+                return {
+                    "approved": False,
+                    "reason": f"Evidence fingerprint mismatch: ledger={review_fp!r}, expected={expected_fp!r}",
+                    "status": review_status,
+                    "findings": findings,
+                }
+
+        # All checks passed — legitimate review record found
+        return {
+            "approved": True,
+            "reason": "",
+            "status": review_status,
+            "findings": findings,
+        }
+
 
 def load_ledger_or_create(ledger_path: str) -> WorkflowLedger:
     """Load a ledger from disk, or create a new one if it doesn't exist.

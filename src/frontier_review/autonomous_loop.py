@@ -328,6 +328,26 @@ class AutonomousCorrectionLoop:
 
             # ── Handle review result ─────────────────────────────────
             if result.status == ReviewStatus.PASS:
+                # ── Final approval gate ──────────────────────────────
+                # Require an existing legitimate review record before
+                # allowing READY_FOR_OPERATOR_REVIEW.  This is the only
+                # point at which a task may transition to operator review.
+                evidence_fp = self.ledger.compute_fingerprint(current_sha, "")
+                approval = self.ledger.validate_approval_record(
+                    task_id=task_id,
+                    workspace_path=self.workspace_path,
+                    commit_sha=current_sha,
+                    test_evidence="",  # Filled in correction-loop patches
+                )
+                if not approval["approved"]:
+                    ws.final_disposition = Disposition.BLOCKED
+                    ws.task_record.final_disposition = Disposition.BLOCKED
+                    logger.warning(
+                        f"[{task_id}] Approval gate blocked: {approval['reason']}"
+                    )
+                    self.ledger.finalize_task(task_id, ws.final_disposition)
+                    return ws
+                # ── Gate passed ──────────────────────────────────────
                 ws.final_disposition = Disposition.READY_FOR_OPERATOR_REVIEW
                 ws.task_record.final_disposition = Disposition.READY_FOR_OPERATOR_REVIEW
                 self.ledger.finalize_task(task_id, ws.final_disposition)
