@@ -324,6 +324,22 @@ class WorkflowLedger:
         self._data[task_id] = rec
         self._save()
 
+    def update_task_sha(self, task_id: str, new_sha: str) -> None:
+        """Update the current SHA for a task and persist it.
+
+        Args:
+            task_id: The task whose SHA to update.
+            new_sha: The new commit SHA (will be truncated to 40 chars).
+        """
+        self._load_under_lock(task_id)
+        if task_id not in self._data:
+            raise ValueError(f"Task '{task_id}' not found for SHA update")
+        rec = self._data[task_id]
+        rec["current_sha"] = new_sha[:40] if len(new_sha) >= 40 else new_sha
+        rec["updated_at"] = datetime.now(timezone.utc).isoformat()
+        self._data[task_id] = rec
+        self._save()
+
     def record_review(
         self,
         task_id: str,
