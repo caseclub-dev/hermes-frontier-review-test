@@ -1,0 +1,19 @@
+{
+  "version": "1.0",
+  "task_id": "phase4-pure-pr13",
+  "workspace_path": "/tmp/.hermes/cache/scratch/fr-correction-phase4-pure-pr13",
+  "current_sha": "1d2c44af96d5081de7b1f92136ac821a7f8e3a2a",
+  "generated_at": "2026-11-19T04:50:30.603924+00:00",
+  "findings": [
+    {
+      "title": "needs_fixes",
+      "severity": "MEDIUM",
+      "category": "quality",
+      "location": "",
+      "description": "Issues found"
+    }
+  ],
+  "requirements": "Fix the intentionally wrong arithmetic operators in calculator.py. add(a,b) should return a+b (not a*b), multiply(a,b) should return a*b (not a+b).",
+  "acceptance_criteria": [],
+  "code_context": ""
+}
