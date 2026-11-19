@@ -28,7 +28,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 # Ensure the project source is importable
-sys.path.insert(0, "/home/atlas/projects/frontier_review/src")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + "/src")
 
 from frontier_review.autonomous_loop import (
     AutonomousCorrectionLoop,
@@ -61,22 +61,38 @@ def _json_line(data: dict) -> None:
 
 
 def _create_transport_from_env(task_id: str = "", ledger_path: str = "") -> MockAnthropicTransport:
-    """Build a transport from FR_REVIEW_SEQUENCE env var or default PASS.
+    """Build a transport from FR_REVIEW_SEQUENCE env var.
 
     Expected format: JSON array like [\"changes_required\",\"pass\"] or just [\"pass\"].
+
+    IMPORTANT: No default PASS. Missing or invalid configuration is treated as
+    fatal — this prevents silent mock-approval of unreviewed code. Production runs
+    MUST set FR_REVIEW_SEQUENCE explicitly before every invocation.
 
     When task_id and ledger_path are provided, persists consumed scenario index
     in the ledger so scenarios advance across controller invocations.
     """
-    seq_str = os.environ.get("FR_REVIEW_SEQUENCE", '[\"pass\"]')
+    seq_str = os.environ.get("FR_REVIEW_SEQUENCE")
+    if not seq_str:
+        raise ValueError(
+            "FR_REVIEW_SEQUENCE is not set. Mock review requires explicit scenario "
+            "configuration (e.g. '[\"changes_required\"]'). A missing configuration "
+            "defaults to FAIL_CLOSED — never silently PASS."
+        )
+
     try:
         full_sequence = json.loads(seq_str)
-    except json.JSONDecodeError:
-        logger.warning(f"Invalid FR_REVIEW_SEQUENCE: {seq_str!r}, defaulting to [\\\"pass\\\"]")
-        full_sequence = ["pass"]
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"FR_REVIEW_SEQUENCE is not valid JSON ({exc!r}). Expected a JSON array "
+            f"like '[\"changes_required\",\"pass\"]'. Got: {seq_str!r}"
+        )
 
-    if not full_sequence:
-        full_sequence = ["pass"]
+    if not isinstance(full_sequence, list) or len(full_sequence) == 0:
+        raise ValueError(
+            "FR_REVIEW_SEQUENCE must be a non-empty JSON array (e.g. '[\"changes_required\"]'). "
+            f"Got: {full_sequence!r}"
+        )
 
     # Determine starting index from ledger (persists across invocations)
     start_idx = 0
@@ -89,11 +105,16 @@ def _create_transport_from_env(task_id: str = "", ledger_path: str = "") -> Mock
             idx = ledger.get(task_id, {}).get(idx_key, 0)
             start_idx = int(idx)
             if start_idx >= len(full_sequence):
-                # Sequence exhausted — reset to full sequence for re-reviews
-                start_idx = 0
-                remaining_seq = list(full_sequence)
-            else:
-                remaining_seq = full_sequence[start_idx:]
+                # Sequence exhausted — DO NOT silently restart or auto-approve.
+                # Raise an explicit error so the operator sees the gap and reconfigures.
+                raise ValueError(
+                    f"Mock review sequence for {task_id} is exhausted (index={start_idx}, "
+                    f"sequence_len={len(full_sequence)}). Reconfigure FR_REVIEW_SEQUENCE to "
+                    f"supply a new scenario set."
+                )
+            remaining_seq = full_sequence[start_idx:]
+        except ValueError:
+            raise  # re-raise ValueError from exhaustion (fail-closed)
         except Exception as e:
             logger.debug(f"Could not read scenario index from ledger: {e}")
 
@@ -857,9 +878,35 @@ def _process_pr_once(
                             registry._ledger.release_task(task_id, reason=f"approval_blocked: {reason}")
                             continue
 
-                        # Mark pass in registry
+                        # Record evidence and finalize to READY_FOR_OPERATOR_REVIEW.
+                        # MUST use finalize_task (not mark_pass + release_task) so that
+                        # both status and final_disposition are set durably — release_task()
+                        # unconditionally overwrites status to PENDING_REVIEW, which would
+                        # erase the PASS business state (see Subphase 4B-1 defect report).
                         evidence_fp = loop.ledger.compute_fingerprint(sha, "")
-                        registry.mark_pass(task_id, sha, evidence_fp)
+                        try:
+                            raw_data = registry._ledger._data.get(task_id)
+                            if raw_data is not None:
+                                raw_data["remote_head_sha"] = sha
+                                raw_data["evidence_fingerprint"] = evidence_fp
+                                raw_data["review_status"] = "pass"
+                                raw_data["updated_at"] = datetime.now(timezone.utc).isoformat()
+                                registry._ledger._save()
+                        except Exception:
+                            pass  # non-critical; finalize_task below is the authority
+
+                        final_rec = registry._ledger.finalize_task(
+                            task_id, Disposition.READY_FOR_OPERATOR_REVIEW
+                        )
+                        if not final_rec:
+                            _json_line({
+                                "action": "finalize_failed",
+                                "task_id": task_id,
+                                "sha": sha[:8],
+                                "reason": "Could not finalize — leaving as changes_required",
+                            })
+                            registry._ledger.release_task(task_id, reason="finalize_failed")
+                            continue
 
                         gh_pr = GitHubClient(
                             repo_owner=pr_info["repo_owner"],
@@ -874,7 +921,11 @@ def _process_pr_once(
                         )
                         gh_pr.update_pr_ready(pr_info["pr_number"])
 
-                        registry._ledger.release_task(task_id, reason="pass")
+                        # Release claim WITHOUT touching status — finalize_task already set it
+                        try:
+                            registry._ledger.release_task(task_id, reason="pass")
+                        except ValueError:
+                            pass  # release is best-effort after finalization; non-fatal
                     else:
                         # CHANGES_REQUIRED
                         review_count = loop.ledger.get_task_review_count(task_id)
