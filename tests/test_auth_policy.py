@@ -518,3 +518,132 @@ def test_unauthorized_caller_rejection_proposed_model(auth_dir_fixture):
         # Restore permissions for cleanup (needed since we ran chmod 000)
         os.chmod(forbidden_dir, 0o755)
         shutil.rmtree(forbidden_dir, ignore_errors=True)
+
+
+# ------------------------------------------------------------------
+# Publisher-mode counter separation tests
+# ------------------------------------------------------------------
+
+
+class TestPublisherModeCounterSeparation:
+    """Tests for state_dir-based correction counters."""
+
+    def test_publisher_mode_counter_file_creation(
+        self, auth_dir_fixture: Path, tmp_path: Path
+    ) -> None:
+        """consume_correction creates a .counter file in state_dir."""
+        policy = AuthPolicy(str(auth_dir_fixture), str(tmp_path))
+        record = policy.create(VALID_OWNER, VALID_REPO_NAME, 1, VALID_BRANCH, VALID_SHA)
+        auth_id = record["authorization_id"]
+
+        # First consumption
+        policy.consume_correction(auth_id)
+        counter_file = tmp_path / f"{auth_id}.counter"
+        assert counter_file.exists()
+        assert int(counter_file.read_text().strip()) == 1
+
+    def test_publisher_mode_counter_increment(
+        self, auth_dir_fixture: Path, tmp_path: Path
+    ) -> None:
+        """Counter increments correctly in publisher mode."""
+        policy = AuthPolicy(str(auth_dir_fixture), str(tmp_path))
+        record = policy.create(VALID_OWNER, VALID_REPO_NAME, 1, VALID_BRANCH, VALID_SHA)
+        auth_id = record["authorization_id"]
+
+        policy.consume_correction(auth_id)
+        policy.consume_correction(auth_id)
+        policy.consume_correction(auth_id)
+
+        counter_file = tmp_path / f"{auth_id}.counter"
+        assert int(counter_file.read_text().strip()) == 3
+
+    def test_publisher_mode_exceeds_budget(
+        self, auth_dir_fixture: Path, tmp_path: Path
+    ) -> None:
+        """Publisher mode enforces budget via counter file."""
+        policy = AuthPolicy(str(auth_dir_fixture), str(tmp_path))
+        record = policy.create(
+            VALID_OWNER, VALID_REPO_NAME, 1, VALID_BRANCH, VALID_SHA, max_corrections=2
+        )
+        auth_id = record["authorization_id"]
+
+        policy.consume_correction(auth_id)
+        policy.consume_correction(auth_id)
+        with pytest.raises(PolicyViolationError):
+            policy.consume_correction(auth_id)
+
+    def test_publisher_mode_read_counter_without_state_dir(
+        self, auth_dir_fixture: Path, tmp_path: Path
+    ) -> None:
+        """_get_corrections_used returns 0 for publisher-mode ID without state_dir."""
+        policy = AuthPolicy(str(auth_dir_fixture), str(tmp_path))
+        record = policy.create(VALID_OWNER, VALID_REPO_NAME, 1, VALID_BRANCH, VALID_SHA)
+        auth_id = record["authorization_id"]
+
+        # Consume a correction (writes to state_dir)
+        policy.consume_correction(auth_id)
+
+        # New policy instance WITHOUT state_dir should return 0
+        plain_policy = AuthPolicy(str(auth_dir_fixture))
+        assert plain_policy._get_corrections_used(auth_id) == 0
+
+    def test_publisher_mode_authorization_check_uses_state(
+        self, auth_dir_fixture: Path, tmp_path: Path
+    ) -> None:
+        """check_authorized respects publisher-mode counter."""
+        policy = AuthPolicy(str(auth_dir_fixture), str(tmp_path))
+        record = policy.create(
+            VALID_OWNER, VALID_REPO_NAME, 1, VALID_BRANCH, VALID_SHA, max_corrections=2
+        )
+        auth_id = record["authorization_id"]
+
+        # Budget not exhausted yet — authorized
+        ok, _ = policy.check_authorized(VALID_OWNER, VALID_REPO_NAME, 1)
+        assert ok is True
+
+        # Exhaust budget
+        policy.consume_correction(auth_id)
+        policy.consume_correction(auth_id)
+
+        # Now should NOT be authorized
+        ok, _ = policy.check_authorized(VALID_OWNER, VALID_REPO_NAME, 1)
+        assert ok is False
+
+    def test_publisher_mode_persists_across_instances(
+        self, auth_dir_fixture: Path, tmp_path: Path
+    ) -> None:
+        """Counter file survives new AuthPolicy instantiation."""
+        policy = AuthPolicy(str(auth_dir_fixture), str(tmp_path))
+        record = policy.create(VALID_OWNER, VALID_REPO_NAME, 1, VALID_BRANCH, VALID_SHA)
+        auth_id = record["authorization_id"]
+
+        policy.consume_correction(auth_id)
+
+        # New instance sees the persisted counter
+        policy2 = AuthPolicy(str(auth_dir_fixture), str(tmp_path))
+        assert policy2._get_corrections_used(auth_id) == 1
+
+    def test_publisher_mode_no_auth_record_modified(
+        self, auth_dir_fixture: Path, tmp_path: Path
+    ) -> None:
+        """consume_correction in publisher mode does NOT modify auth record."""
+        import json
+
+        policy = AuthPolicy(str(auth_dir_fixture), str(tmp_path))
+        record = policy.create(VALID_OWNER, VALID_REPO_NAME, 1, VALID_BRANCH, VALID_SHA)
+        auth_id = record["authorization_id"]
+
+        # Read original record — corrections_used should be 0 (or absent)
+        filepath = auth_dir_fixture / f"{auth_id}.json"
+        with open(filepath) as f:
+            orig = json.load(f)
+        assert orig.get("corrections_used", 0) == 0
+
+        # Consume in publisher mode
+        policy.consume_correction(auth_id)
+        policy.consume_correction(auth_id)
+
+        # Auth record is still untouched
+        with open(filepath) as f:
+            updated = json.load(f)
+        assert updated.get("corrections_used", 0) == 0

@@ -214,13 +214,25 @@ class AuthPolicy:
                                "hermis/fix-build", "abc123" * 7)
     """
 
-    def __init__(self, auth_dir: str | None = None) -> None:
+    def __init__(
+        self, auth_dir: str | None = None, state_dir: str | None = None
+    ) -> None:
         """Initialize AuthPolicy with the authorization directory.
 
         Resolves auth_dir in this order of precedence:
           1. Explicit parameter (auth_dir)
           2. Environment variable FR_AUTH_DIR
           3. Default path DEFAULT_AUTH_DIR
+
+        state_dir is an optional separate directory for publisher-owned
+        correction counters. When set, consume_correction() writes the
+        counter to this directory instead of modifying auth record files.
+        This allows the fr-publisher identity (which cannot write to the
+        root-owned auth directory) to track its own usage count.
+
+        Defaults:
+          - state_dir from environment variable FR_STATE_DIR
+          - None (operator mode — original behavior)
         """
         if auth_dir is not None:
             self._auth_dir = auth_dir
@@ -233,6 +245,14 @@ class AuthPolicy:
 
         # Ensure the directory exists
         Path(self._auth_dir).mkdir(parents=True, exist_ok=True)
+
+        if state_dir is not None:
+            self._state_dir = state_dir
+        else:
+            self._state_dir = os.environ.get("FR_STATE_DIR") or None
+
+        if self._state_dir is not None:
+            Path(self._state_dir).mkdir(parents=True, exist_ok=True)
 
     @property
     def auth_dir(self) -> str:
@@ -484,8 +504,10 @@ class AuthPolicy:
             if expires < now:
                 continue
 
-            # Check correction budget
-            corrections_used = record.get("corrections_used", 0)
+            # Check correction budget via unified accessor
+            corrections_used = self._get_corrections_used(
+                record["authorization_id"]
+            )
             max_corr = record.get("max_corrections", 3)
             if corrections_used >= max_corr:
                 continue
@@ -500,6 +522,11 @@ class AuthPolicy:
 
     def consume_correction(self, authorization_id: str) -> bool:
         """Increment corrections_used and write atomically.
+
+        When state_dir is set (publisher mode), the counter file is written
+        to the separate state directory rather than modifying the auth record.
+        This allows the fr-publisher identity (which cannot write to the
+        root-owned auth directory) to track its own correction count.
 
         Args:
             authorization_id: UUID string of the authorization record.
@@ -518,13 +545,55 @@ class AuthPolicy:
             )
 
         record = self._load_record(filepath)
-        record["corrections_used"] = record.get("corrections_used", 0) + 1
-
-        corrections_used = record["corrections_used"]
         max_corr = record.get("max_corrections", 3)
 
-        # Write the incremented counter atomically
+        if self._state_dir is not None:
+            # Publisher mode: counter lives in separate state dir
+            counter_file = os.path.join(
+                self._state_dir, f"{authorization_id}.counter"
+            )
+            try:
+                with open(counter_file) as f:
+                    current = int(f.read().strip())
+            except (FileNotFoundError, ValueError):
+                current = 0
+
+            new_count = current + 1
+
+            if new_count > max_corr:
+                logger.warning(
+                    "Correction budget exceeded for %s: %d/%d",
+                    authorization_id[:8], new_count, max_corr,
+                )
+                raise PolicyViolationError(
+                    f"Correction budget exceeded: {new_count}/{max_corr}"
+                )
+
+            # Atomic write to state dir
+            fd, tmp_path = tempfile.mkstemp(suffix=".tmp", dir=self._state_dir)
+            try:
+                with os.fdopen(fd, "w") as f:
+                    f.write(str(new_count))
+                os.chmod(tmp_path, 0o640)
+                os.rename(tmp_path, counter_file)
+            except BaseException:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
+
+            logger.info(
+                "Consumed correction %d/%d for %s (state dir)",
+                new_count, max_corr, authorization_id[:8],
+            )
+            return True
+
+        # Operator mode (original behavior): modify auth record directly
+        record["corrections_used"] = record.get("corrections_used", 0) + 1
         self._save_record(record, filepath)
+
+        corrections_used = record["corrections_used"]
 
         if corrections_used > max_corr:
             logger.warning(
@@ -536,6 +605,35 @@ class AuthPolicy:
             )
 
         return True
+
+    def _get_corrections_used(self, authorization_id: str) -> int:
+        """Return the current correction count for an authorization.
+
+        When state_dir is set (publisher mode), reads from a separate
+        counter file in the state directory. Otherwise falls back to
+        reading corrections_used from the auth record itself.
+
+        Args:
+            authorization_id: UUID string of the authorization record.
+
+        Returns:
+            Integer correction count.
+        """
+        if self._state_dir is not None:
+            counter_file = os.path.join(
+                self._state_dir, f"{authorization_id}.counter"
+            )
+            try:
+                with open(counter_file) as f:
+                    return int(f.read().strip())
+            except (FileNotFoundError, ValueError):
+                return 0
+        else:
+            filepath = self._record_path(authorization_id)
+            if not os.path.isfile(filepath):
+                return 0
+            record = self._load_record(filepath)
+            return record.get("corrections_used", 0)
 
     # ------------------------------------------------------------------
     # Internal helpers
