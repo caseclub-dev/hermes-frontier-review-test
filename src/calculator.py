@@ -15,13 +15,8 @@ def subtract(a, b):
 
 
 def multiply(a, b):
-    """BUG: Returns sum instead of product.
-
-    This is the bug that Coder must fix during the acceptance test.
-    Expected behavior: multiply(a, b) should return a * b.
-    Actual (buggy) behavior: returns a + b.
-    """
-    return a + b
+    """Return product of two numbers."""
+    return a * b
 
 
 def divide(a, b):
