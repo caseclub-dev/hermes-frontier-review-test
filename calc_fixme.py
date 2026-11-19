@@ -1,4 +1,5 @@
 def divide(a, b):
-    """Divide a by b. Currently buggy."""
-    # Bug: no zero check, wrong order
+    """Divide a by b. Returns the quotient or None on division by zero."""
+    if b == 0:
+        return None
     return a / b
