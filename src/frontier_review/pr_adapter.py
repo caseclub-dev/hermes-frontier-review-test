@@ -595,8 +595,13 @@ def push_correction_to_github(
     repo_name: str,
     head_branch: str,
     token: str,
+    workspace_path: str = "",
 ) -> tuple[bool, str]:
     """Push the local feature branch to GitHub and return (success, remote_sha).
+
+    Args:
+        workspace_path: If provided, git commands run from this directory.
+                        Otherwise uses the current working directory.
 
     Returns:
         (True, sha) on success — remote HEAD matches what was pushed.
@@ -607,10 +612,13 @@ def push_correction_to_github(
     """
     import os as _os
 
+    # Determine working directory for git operations
+    work_dir = workspace_path if workspace_path and os.path.isdir(workspace_path) else None
+
     # Step 1: Verify we are on the expected branch
     r = subprocess.run(
         ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-        capture_output=True, text=True, timeout=5,
+        capture_output=True, text=True, timeout=5, cwd=work_dir,
     )
     if r.stdout.strip() != head_branch:
         return False, f"Expected branch {head_branch}, got {r.stdout.strip()}"
@@ -618,7 +626,7 @@ def push_correction_to_github(
     # Step 2: Get local HEAD SHA before push
     r_local = subprocess.run(
         ["git", "rev-parse", "HEAD"],
-        capture_output=True, text=True, timeout=5,
+        capture_output=True, text=True, timeout=5, cwd=work_dir,
     )
     local_sha = r_local.stdout.strip()
 
@@ -630,8 +638,7 @@ def push_correction_to_github(
         url = f"https://{token}@github.com/{repo_owner}/{repo_name}.git"
         r_push = subprocess.run(
             ["git", "push", "origin", f"{head_branch}:{head_branch}"],
-            capture_output=True, text=True, timeout=120,
-            env=_env2,
+            capture_output=True, text=True, timeout=120, env=_env2, cwd=work_dir,
         )
     finally:
         pass  # _env cleanup not needed since we used a copy
