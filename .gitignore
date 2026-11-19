@@ -1,0 +1,14 @@
+# Bytecode cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Correction jobs (runtime state)
+correction_jobs/
+correction_jobs_archive/
