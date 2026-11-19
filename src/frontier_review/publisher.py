@@ -12,8 +12,9 @@ Request schema validation:
   - repo_owner, repo_name: must match configured allowlist
   - head_branch: must match branch pattern (hermes/<task-id>)
   - workspace_path: existing directory, max 512 chars, git repo
-  - expected_remote_sha / ref_sha: 40-hex characters only
-  - pr_number: positive integer if present
+  - expected_remote_sha: mandatory 40-hex SHA for action=push
+  - ref_sha: 40-hex characters for action=status
+  - pr_number: mandatory positive integer for action=push
 
 Operations available to the publisher:
   push         — clone feature branch, copy workspace, fast-forward push (no force)
@@ -180,16 +181,25 @@ def validate_request(payload: bytes) -> dict[str, Any]:
         _validate_branch(req["head_branch"])
 
     # --- SHA validation -----------------------------------------------
-    expected_sha = req.get("expected_remote_sha") or ""
     ref_sha = req.get("ref_sha") or ""
-    if expected_sha:
-        _validate_sha(expected_sha, "expected_remote_sha")
     if ref_sha and action == ACTION_STATUS:
         _validate_sha(ref_sha, "ref_sha")
 
+    # expected_remote_sha is mandatory for push
+    if action == ACTION_PUSH:
+        if "expected_remote_sha" not in req:
+            raise PublisherValidationError(
+                "expected_remote_sha is required for action=push"
+            )
+        _validate_sha(req["expected_remote_sha"], "expected_remote_sha")
+
     # --- PR number ------------------------------------------------------
-    pr_number = req.get("pr_number")
-    if pr_number is not None:
+    if action == ACTION_PUSH:
+        if "pr_number" not in req:
+            raise PublisherValidationError(
+                "pr_number is required for action=push"
+            )
+        pr_number = req["pr_number"]
         if not isinstance(pr_number, int) or pr_number <= 0:
             raise PublisherValidationError(
                 "pr_number must be a positive integer"
@@ -327,15 +337,27 @@ def perform_push(
     Security checks performed before any Git operation:
       1. Branch must match hermes/* pattern (validated in validate_request)
       2. Workspace must be an existing git repo with at least one commit
-      3. Remote HEAD must be ancestor of workspace HEAD (fast-forward only)
-      4. Push is always fast-forward (no force flag ever used)
+      3. Remote branch must already exist (no new branch creation)
+      4. expected_remote_sha is mandatory for push action
+      5. Remote HEAD must match expected_remote_sha immediately before push
+      6. Workspace HEAD must be a descendant of expected_remote_sha
+      7. Push is always fast-forward (no force flag ever used)
     """
     action = ACTION_PUSH
     head_branch = req["head_branch"]
     ws_path = req["workspace_path"]
     repo_owner = req["repo_owner"]
     repo_name = req["repo_name"]
-    expected_remote_sha = req.get("expected_remote_sha") or ""
+    expected_remote_sha: str = req.get("expected_remote_sha", "") or ""
+    pr_number = req.get("pr_number")
+
+    # Defensive check — validate_request should enforce these but callers may bypass
+    if not expected_remote_sha:
+        _audit(action, False, "missing expected_remote_sha", head_branch=head_branch)
+        return {"action": action, "success": False, "error": "expected_remote_sha is required for push"}
+    if pr_number is None or not isinstance(pr_number, int) or pr_number <= 0:
+        _audit(action, False, "missing or invalid pr_number", head_branch=head_branch)
+        return {"action": action, "success": False, "error": "pr_number is required for push"}
 
     # Validate workspace is a git repo with commits
     if not os.path.isdir(ws_path):
@@ -370,19 +392,56 @@ def perform_push(
             # Create local branch from HEAD so git push has a source ref
             _run_git(["branch", head_branch, "HEAD"], cwd=ws_path)
 
-        # If expected_remote_sha is set, verify workspace HEAD is a descendant
-        if expected_remote_sha:
-            r = _run_git(
-                ["merge-base", "--is-ancestor", expected_remote_sha, local_head_sha],
-                cwd=ws_path,
+        # Check that remote branch already exists (no new branch creation)
+        r = _run_git(
+            ["ls-remote", mock_bare_repo, f"refs/heads/{head_branch}"],
+        )
+        if r.returncode != 0 or not r.stdout.strip():
+            _audit(action, False, "remote branch does not exist", head_branch=head_branch)
+            return {
+                "action": action,
+                "success": False,
+                "error": f"Remote branch {head_branch} does not exist — only correction publication is allowed",
+            }
+
+        # Verify remote HEAD matches expected_remote_sha immediately before push
+        r = _run_git(["rev-parse", f"origin/{head_branch}"], cwd=ws_path)
+        if r.returncode != 0:
+            _audit(action, False, "could not read remote branch ref", head_branch=head_branch)
+            return {
+                "action": action,
+                "success": False,
+                "error": f"Could not verify remote HEAD for {head_branch}",
+            }
+        current_remote_sha = r.stdout.strip()
+        if current_remote_sha != expected_remote_sha:
+            _audit(
+                action, False,
+                f"remote SHA mismatch: got {current_remote_sha[:12]} expected {expected_remote_sha[:12]}",
+                head_branch=head_branch,
             )
-            if r.returncode != 0:
-                _audit(action, False, "non-descendant commit", head_branch=head_branch)
-                return {
-                    "action": action,
-                    "success": False,
-                    "error": f"Local HEAD is not a descendant of expected SHA {expected_remote_sha[:12]}",
-                }
+            return {
+                "action": action,
+                "success": False,
+                "error": (
+                    f"Remote branch HEAD ({current_remote_sha[:12]}) does not match "
+                    f"expected SHA ({expected_remote_sha[:12]}). Branch may have been "
+                    "updated externally — correction rejected."
+                ),
+            }
+
+        # Verify workspace HEAD is a descendant of expected_remote_sha
+        r = _run_git(
+            ["merge-base", "--is-ancestor", expected_remote_sha, local_head_sha],
+            cwd=ws_path,
+        )
+        if r.returncode != 0:
+            _audit(action, False, "non-descendant commit", head_branch=head_branch)
+            return {
+                "action": action,
+                "success": False,
+                "error": f"Local HEAD is not a descendant of expected SHA {expected_remote_sha[:12]}",
+            }
 
         # Fast-forward push only (no force flag)
         r = _run_git(
@@ -393,7 +452,7 @@ def perform_push(
             _audit(action, False, f"push failed: {r.stderr[:200]}", head_branch=head_branch)
             return {"action": action, "success": False, "error": r.stderr.strip()[:500]}
 
-        # Verify remote HEAD
+        # Verify remote HEAD after push
         r = _run_git(["rev-parse", f"origin/{head_branch}"], cwd=ws_path)
         if r.returncode == 0:
             remote_sha = r.stdout.strip()

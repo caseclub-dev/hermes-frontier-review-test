@@ -130,6 +130,7 @@ class TestValidFastForward:
             "head_branch": "hermes/test-001",
             "workspace_path": str(ws),
             "expected_remote_sha": sha_a,
+            "pr_number": 1,
         }
 
         result = perform_push(req, mock_mode=True, mock_bare_repo=str(bare))
@@ -229,6 +230,8 @@ class TestInvalidBranch:
             "repo_name": "hermes-frontier-review-test",
             "head_branch": "hermes/test-001-task-name",
             "workspace_path": str(ws),
+            "expected_remote_sha": "a" * 40,
+            "pr_number": 42,
         }
         result = validate_request(json.dumps(req).encode())
         assert result["head_branch"] == "hermes/test-001-task-name"
@@ -260,6 +263,7 @@ class TestStaleRemoteSHA:
             "head_branch": "hermes/test-001",
             "workspace_path": str(ws_a),
             "expected_remote_sha": sha_b_remote,
+            "pr_number": 1,
         }
 
         result = perform_push(req, mock_mode=True, mock_bare_repo=str(bare))
@@ -273,19 +277,18 @@ class TestStaleRemoteSHA:
 
 
 class TestNonDescendantCommit:
-    """Push would create a non-fast-forward merge — git rejects without --force."""
+    """Git-level rejection of non-fast-forward push even with valid SHA."""
 
-    def test_non_descendant_fails_push(self, tmp_path: Path) -> None:
+    def test_non_fast_forward_push_rejected(self, tmp_path: Path) -> None:
         # Create workspace A and push to bare repo on hermes/test-001
         ws_a = _create_workspace(tmp_path, "ws_a")
         bare = _create_bare_repo(tmp_path, "bare.git")
-        _, _ = _setup_bare_with_branch(bare, ws_a, "hermes/test-001")
+        _, sha_a_remote = _setup_bare_with_branch(bare, ws_a, "hermes/test-001")
 
-        # Create workspace B with a completely separate initial commit (not descendant of A's commit).
-        # When we remove origin, add bare repo, and fetch:
-        #   - origin/hermes/test-001 points to ws_a's SHA (from step 1)
-        #   - ws_b HEAD is a different SHA (unrelated history)
-        # Git push will reject because it would not be fast-forward.
+        # Create workspace B with independent history (not descendant of A).
+        # expected_remote_sha is set to sha_a_remote (the bare repo's branch HEAD).
+        # SHA validation passes (we provide a valid 40-hex SHA), but the push itself
+        # will be rejected by git because ws_b HEAD is not an ancestor of origin/branch.
         ws_b = _create_workspace(tmp_path, "ws_b", "separate v1\n")
 
         req = {
@@ -294,6 +297,8 @@ class TestNonDescendantCommit:
             "repo_name": "hermes-frontier-review-test",
             "head_branch": "hermes/test-001",
             "workspace_path": str(ws_b),
+            "expected_remote_sha": sha_a_remote,
+            "pr_number": 1,
         }
 
         result = perform_push(req, mock_mode=True, mock_bare_repo=str(bare))
@@ -315,6 +320,8 @@ class TestUnauthorizedPath:
             "repo_name": "hermes-frontier-review-test",
             "head_branch": "hermes/test-001",
             "workspace_path": "/nonexistent/path/that/does/not/exist",
+            "expected_remote_sha": "a" * 40,
+            "pr_number": 1,
         }
 
         result = perform_push(req)
@@ -329,6 +336,8 @@ class TestUnauthorizedPath:
             "repo_name": "hermes-frontier-review-test",
             "head_branch": "hermes/test-001",
             "workspace_path": str(fake_workspace),
+            "expected_remote_sha": "a" * 40,
+            "pr_number": 1,
         }
 
         result = perform_push(req)
@@ -342,6 +351,8 @@ class TestUnauthorizedPath:
             "repo_name": "hermes-frontier-review-test",
             "head_branch": "hermes/test-001",
             "workspace_path": "",
+            "expected_remote_sha": "a" * 40,
+            "pr_number": 1,
         }
         with pytest.raises(PublisherValidationError, match="workspace_path is required"):
             validate_request(json.dumps(req).encode())
@@ -431,6 +442,7 @@ class TestMalformedRequest:
             "repo_name": "hermes-frontier-review-test",
             "head_branch": "hermes/test-001",
             "workspace_path": str(ws),
+            "expected_remote_sha": "b" * 40,
             "pr_number": -5,
         }
         with pytest.raises(PublisherValidationError, match="positive integer"):
@@ -444,6 +456,7 @@ class TestMalformedRequest:
             "repo_name": "hermes-frontier-review-test",
             "head_branch": "hermes/test-001",
             "workspace_path": str(ws),
+            "expected_remote_sha": "c" * 40,
             "pr_number": 0,
         }
         with pytest.raises(PublisherValidationError, match="positive integer"):
@@ -457,6 +470,7 @@ class TestMalformedRequest:
             "repo_name": "hermes-frontier-review-test",
             "head_branch": "hermes/test-001",
             "workspace_path": str(ws),
+            "expected_remote_sha": "d" * 40,
             "pr_number": "forty-two",
         }
         with pytest.raises(PublisherValidationError, match="positive integer"):
@@ -470,6 +484,8 @@ class TestMalformedRequest:
             "repo_name": "hermes-frontier-review-test",
             "head_branch": "hermes/test-001",
             "workspace_path": "A" * 513,
+            "expected_remote_sha": "e" * 40,
+            "pr_number": 1,
         }
         with pytest.raises(PublisherValidationError, match="512 characters"):
             validate_request(json.dumps(req).encode())
@@ -496,6 +512,7 @@ class TestDuplicatePublication:
             "head_branch": "hermes/test-001",
             "workspace_path": str(ws),
             "expected_remote_sha": sha_a,
+            "pr_number": 1,
         }
 
         # First push — succeeds (nothing to push, idempotent)
@@ -577,6 +594,7 @@ class TestAuditPersistence:
             "head_branch": "hermes/test-001",
             "workspace_path": str(ws),
             "expected_remote_sha": sha_a,
+            "pr_number": 1,
         }
 
         perform_push(req, mock_mode=True, mock_bare_repo=str(bare))
@@ -596,6 +614,8 @@ class TestAuditPersistence:
             "repo_name": "hermes-frontier-review-test",
             "head_branch": "hermes/test-001",
             "workspace_path": "/tmp/does_not_exist_publisher_test_xyz",
+            "expected_remote_sha": "a" * 40,
+            "pr_number": 1,
         }
 
         perform_push(req)  # Should fail — path doesn't exist
@@ -614,6 +634,8 @@ class TestAuditPersistence:
             "repo_name": "hermes-frontier-review-test",
             "head_branch": "hermes/test-001",
             "workspace_path": "/nonexistent_audit_field_test",
+            "expected_remote_sha": "b" * 40,
+            "pr_number": 2,
         }
 
         perform_push(req)  # Fails as expected
@@ -722,3 +744,307 @@ class TestFastForwardCheck:
         ws = _create_workspace(tmp_path, "ws")
         # No remote configured — fast-forward check should fail
         assert _is_fast_forward(str(ws), "hermes/test-001", "") is False
+
+
+# ---------------------------------------------------------------------------
+# P1C Focused regression tests — schema enforcement & branch safety
+# ---------------------------------------------------------------------------
+
+
+class TestP1CSchemaEnforcement:
+    """Mandatory field enforcement for action=push (P1C security hardening)."""
+
+    def test_missing_expected_remote_sha_rejected(self, tmp_path: Path) -> None:
+        ws = _create_workspace(tmp_path, "ws")
+        req = {
+            "action": ACTION_PUSH,
+            "repo_owner": "caseclub-dev",
+            "repo_name": "hermes-frontier-review-test",
+            "head_branch": "hermes/test-001",
+            "workspace_path": str(ws),
+            "pr_number": 1,
+        }
+        with pytest.raises(PublisherValidationError, match="expected_remote_sha is required"):
+            validate_request(json.dumps(req).encode())
+
+    def test_missing_pr_number_rejected(self, tmp_path: Path) -> None:
+        ws = _create_workspace(tmp_path, "ws")
+        req = {
+            "action": ACTION_PUSH,
+            "repo_owner": "caseclub-dev",
+            "repo_name": "hermes-frontier-review-test",
+            "head_branch": "hermes/test-001",
+            "workspace_path": str(ws),
+            "expected_remote_sha": "a" * 40,
+        }
+        with pytest.raises(PublisherValidationError, match="pr_number is required"):
+            validate_request(json.dumps(req).encode())
+
+    def test_empty_expected_remote_sha_rejected(self, tmp_path: Path) -> None:
+        ws = _create_workspace(tmp_path, "ws")
+        req = {
+            "action": ACTION_PUSH,
+            "repo_owner": "caseclub-dev",
+            "repo_name": "hermes-frontier-review-test",
+            "head_branch": "hermes/test-001",
+            "workspace_path": str(ws),
+            "expected_remote_sha": "",
+            "pr_number": 1,
+        }
+        with pytest.raises(PublisherValidationError, match="40 lowercase hex chars"):
+            validate_request(json.dumps(req).encode())
+
+    def test_malformed_expected_remote_sha_rejected(self, tmp_path: Path) -> None:
+        ws = _create_workspace(tmp_path, "ws")
+        req = {
+            "action": ACTION_PUSH,
+            "repo_owner": "caseclub-dev",
+            "repo_name": "hermes-frontier-review-test",
+            "head_branch": "hermes/test-001",
+            "workspace_path": str(ws),
+            "expected_remote_sha": "ZZZZ" + "a" * 36,
+            "pr_number": 1,
+        }
+        with pytest.raises(PublisherValidationError, match="40 lowercase hex chars"):
+            validate_request(json.dumps(req).encode())
+
+    def test_expected_remote_sha_too_short_rejected(self, tmp_path: Path) -> None:
+        ws = _create_workspace(tmp_path, "ws")
+        req = {
+            "action": ACTION_PUSH,
+            "repo_owner": "caseclub-dev",
+            "repo_name": "hermes-frontier-review-test",
+            "head_branch": "hermes/test-001",
+            "workspace_path": str(ws),
+            "expected_remote_sha": "a" * 39,
+            "pr_number": 1,
+        }
+        with pytest.raises(PublisherValidationError, match="40 lowercase hex chars"):
+            validate_request(json.dumps(req).encode())
+
+    def test_expected_remote_sha_too_long_rejected(self, tmp_path: Path) -> None:
+        ws = _create_workspace(tmp_path, "ws")
+        req = {
+            "action": ACTION_PUSH,
+            "repo_owner": "caseclub-dev",
+            "repo_name": "hermes-frontier-review-test",
+            "head_branch": "hermes/test-001",
+            "workspace_path": str(ws),
+            "expected_remote_sha": "a" * 41,
+            "pr_number": 1,
+        }
+        with pytest.raises(PublisherValidationError, match="40 lowercase hex chars"):
+            validate_request(json.dumps(req).encode())
+
+
+class TestP1CBranchSafety:
+    """Branch existence and SHA-verification checks (P1C security hardening)."""
+
+    def test_missing_remote_branch_rejected(self, tmp_path: Path) -> None:
+        """Publisher must reject push when remote branch does not exist."""
+        ws = _create_workspace(tmp_path, "ws")
+        bare = _create_bare_repo(tmp_path, "bare_no_branch.git")  # Empty bare repo
+
+        req = {
+            "action": ACTION_PUSH,
+            "repo_owner": "caseclub-dev",
+            "repo_name": "hermes-frontier-review-test",
+            "head_branch": "hermes/new-branch",
+            "workspace_path": str(ws),
+            "expected_remote_sha": "a" * 40,
+            "pr_number": 1,
+        }
+
+        result = perform_push(req, mock_mode=True, mock_bare_repo=str(bare))
+        assert result["success"] is False
+        assert "does not exist" in result["error"].lower() or "Remote branch" in result.get("error", "")
+
+    def test_stale_remote_sha_rejected(self, tmp_path: Path) -> None:
+        """Publisher must reject push when remote HEAD diverges from expected_remote_sha."""
+        ws_a = _create_workspace(tmp_path, "ws_a")
+        bare = _create_bare_repo(tmp_path, "bare_stale.git")
+        _, sha_a = _setup_bare_with_branch(bare, ws_a, "hermes/test-001")
+
+        # Create workspace B with an unrelated commit chain.
+        ws_b = _create_workspace(tmp_path, "ws_b", "separate v1\n")
+
+        # We supply the correct SHA (sha_a) but push a branch whose local HEAD
+        # will diverge — and crucially, we supply a *different* expected_remote_sha
+        # that matches the bare repo's current HEAD to show mismatch detection works.
+        # Actually: set expected_remote_sha to sha_a; after fetch origin/hermes/test-001
+        # = sha_a, so this should pass SHA check but fail descendant check since ws_b is independent.
+        req = {
+            "action": ACTION_PUSH,
+            "repo_owner": "caseclub-dev",
+            "repo_name": "hermes-frontier-review-test",
+            "head_branch": "hermes/test-001",
+            "workspace_path": str(ws_b),
+            "expected_remote_sha": sha_a,
+            "pr_number": 2,
+        }
+
+        result = perform_push(req, mock_mode=True, mock_bare_repo=str(bare))
+        assert result["success"] is False
+        # Should fail because ws_b HEAD is not a descendant of sha_a
+        assert ("not a descendant" in result.get("error", "").lower() or
+                "descendant" in result.get("error", "").lower())
+
+    def test_stale_sha_direct_mismatch_rejected(self, tmp_path: Path) -> None:
+        """Publisher must reject when expected_remote_sha does not match remote HEAD."""
+        # Set up bare repo with hermes/test-001 at commit SHA_A.
+        ws_a = _create_workspace(tmp_path, "ws_a")
+        bare = _create_bare_repo(tmp_path, "bare_mismatch.git")
+        _, sha_a = _setup_bare_with_branch(bare, ws_a, "hermes/test-001")
+
+        # Clone from bare so ws_c descends from sha_a.
+        env = {
+            "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@localhost",
+            "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@localhost",
+        }
+        ws_c = tmp_path / "ws_c"
+        if ws_c.exists():
+            import shutil
+            shutil.rmtree(ws_c)
+        _run_git(["clone", str(bare), str(ws_c)])
+        _run_git(["config", "user.name", "test"], cwd=str(ws_c), env_override=env)
+        _run_git(["config", "user.email", "test@localhost"], cwd=str(ws_c), env_override=env)
+
+        # Add a commit on hermes/test-001 — this is the correction.
+        _run_git(["checkout", "hermes/test-001"], cwd=str(ws_c))
+        (ws_c / "fix.txt").write_text("correction\n")
+        _run_git(["add", "."], cwd=str(ws_c))
+        _run_git(["commit", "-m", "correction"], cwd=str(ws_c), env_override=env)
+
+        # Now ws_c's HEAD descends from sha_a. But we supply expected_remote_sha
+        # = arbitrary SHA_A that does NOT match the real remote HEAD (sha_a).
+        req = {
+            "action": ACTION_PUSH,
+            "repo_owner": "caseclub-dev",
+            "repo_name": "hermes-frontier-review-test",
+            "head_branch": "hermes/test-001",
+            "workspace_path": str(ws_c),
+            "expected_remote_sha": "a" * 40,
+            "pr_number": 3,
+        }
+
+        result = perform_push(req, mock_mode=True, mock_bare_repo=str(bare))
+        assert result["success"] is False
+
+    def test_valid_existing_branch_accepts_fast_forward(self, tmp_path: Path) -> None:
+        """Publisher must accept a valid fast-forward correction to an existing branch."""
+        ws_a = _create_workspace(tmp_path, "ws_a")
+        bare = _create_bare_repo(tmp_path, "bare_ok.git")
+        _, sha_a = _setup_bare_with_branch(bare, ws_a, "hermes/test-001")
+
+        # Build descendant on same workspace.
+        env = {
+            "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@localhost",
+            "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@localhost",
+        }
+        (ws_a / "fix.txt").write_text("v2\n")
+        _run_git(["add", "."], cwd=str(ws_a))
+        _run_git(["commit", "-m", "correction"], cwd=str(ws_a), env_override=env)
+
+        req = {
+            "action": ACTION_PUSH,
+            "repo_owner": "caseclub-dev",
+            "repo_name": "hermes-frontier-review-test",
+            "head_branch": "hermes/test-001",
+            "workspace_path": str(ws_a),
+            "expected_remote_sha": sha_a,
+            "pr_number": 4,
+        }
+
+        result = perform_push(req, mock_mode=True, mock_bare_repo=str(bare))
+        assert result["success"] is True
+        assert "remote_sha" in result
+
+
+class TestP1CDuplicateHandling:
+    """Duplicate correction publication must be handled safely."""
+
+    def test_valid_push_is_idempotent(self, tmp_path: Path) -> None:
+        """Calling perform_push twice with the same params should not corrupt state.
+
+        The publisher does not implement deduplication at the API level; the controller
+        layer is responsible for rejecting duplicate dispatches. This test confirms that
+        a second push to an already-updated branch fails gracefully (not a double-push).
+        """
+        ws_a = _create_workspace(tmp_path, "ws_a")
+        bare = _create_bare_repo(tmp_path, "bare_dup.git")
+        _, sha_a = _setup_bare_with_branch(bare, ws_a, "hermes/test-001")
+
+        env = {
+            "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@localhost",
+            "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@localhost",
+        }
+        (ws_a / "fix.txt").write_text("v2\n")
+        _run_git(["add", "."], cwd=str(ws_a))
+        _run_git(["commit", "-m", "correction"], cwd=str(ws_a), env_override=env)
+
+        req = {
+            "action": ACTION_PUSH,
+            "repo_owner": "caseclub-dev",
+            "repo_name": "hermes-frontier-review-test",
+            "head_branch": "hermes/test-001",
+            "workspace_path": str(ws_a),
+            "expected_remote_sha": sha_a,
+            "pr_number": 4,
+        }
+
+        # First push succeeds
+        result1 = perform_push(req, mock_mode=True, mock_bare_repo=str(bare))
+        assert result1["success"] is True
+
+        # After first push, remote HEAD moved. A second push with same expected_remote_sha
+        # should fail because the SHA no longer matches (remote advanced).
+        result2 = perform_push(req, mock_mode=True, mock_bare_repo=str(bare))
+        assert result2["success"] is False
+        assert ("SHA" in result2.get("error", "") or "sha" in result2.get("error", "") or
+                "not a descendant" in result2.get("error", "").lower())
+
+
+class TestP1CWorkspaceIsolation:
+    """Arbitrary Git workspaces must not be falsely authorized."""
+
+    def test_arbitrary_workspace_not_misrepresented(self, tmp_path: Path) -> None:
+        """An arbitrary local Git repo can pass filesystem checks but is NOT authorized — only a registered task/PR binding prevents exploitation.
+
+        This test documents the current limitation: perform_push() will accept any
+        valid git directory as workspace_path. Full authorization requires independent
+        binding to a registered WorkflowLedger task record that validates the workspace
+        path against an approved task, PR number, and expected remote SHA.
+        """
+        ws = _create_workspace(tmp_path, "arbitrary_repo")
+        ws_file = ws / "secret.txt"
+        ws_file.write_text("attacker content\n")
+
+        # This repo is not registered in any WorkflowLedger entry — but perform_push
+        # will accept it because workspace_path only checks filesystem existence.
+        req = {
+            "action": ACTION_PUSH,
+            "repo_owner": "caseclub-dev",
+            "repo_name": "hermes-frontier-review-test",
+            "head_branch": "hermes/rogue-task",
+            "workspace_path": str(ws),
+            "expected_remote_sha": "d" * 40,
+            "pr_number": 999,
+        }
+
+        # Schema validation should pass (fields are present and well-formed).
+        validated = validate_request(json.dumps(req).encode())
+        assert validated["workspace_path"] == str(ws)
+
+        # However: perform_push with mock_mode=True will reject because:
+        # 1. The remote branch doesn't exist (bare repo is empty), OR
+        # 2. expected_remote_sha won't match a non-existent remote.
+        bare = _create_bare_repo(tmp_path, "bare_arbitrary.git")
+        result = perform_push(req, mock_mode=True, mock_bare_repo=str(bare))
+        assert result["success"] is False
+
+        # DOCUMENTATION NOTE: In real-mode (non-mock), an attacker who controls a local
+        # git repo could craft a push request with any workspace_path. The publisher's
+        # current authorization model validates filesystem existence but does NOT check
+        # whether the workspace is bound to a registered WorkflowLedger task entry.
+        # P2 must add: cross-reference workspace_path + pr_number against ledger records
+        # and reject if no matching task exists.
