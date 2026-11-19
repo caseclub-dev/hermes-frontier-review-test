@@ -28,6 +28,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -95,6 +96,49 @@ def _setup_bare_with_branch(
     return str(bare), remote_sha
 
 
+from datetime import datetime, timedelta, timezone
+
+
+def _create_push_auth(
+    auth_dir: str, repo_owner: str, repo_name: str, pr_number: int, head_branch: str
+) -> dict[str, Any]:
+    """Create an authorization record and return the record dict.
+
+    Writes to FR_AUTH_DIR from env (set by conftest fixture) using a flat
+    file name so AuthPolicy.check_authorized() can find it via glob("*.json").
+    """
+    import json as _json
+    from pathlib import Path as _Path
+
+    # Resolve auth dir — fall back to FR_AUTH_DIR from environment
+    if not auth_dir:
+        auth_dir = os.environ.get("FR_AUTH_DIR", "")
+    if not auth_dir:
+        return {}
+
+    now = datetime.now(timezone.utc)
+    auth_id = f"auth-{repo_owner}-{repo_name}-{pr_number}"
+    record = {
+        "authorization_id": auth_id,
+        "repository_owner": repo_owner,
+        "repository_name": repo_name,
+        "pr_number": pr_number,
+        "head_branch": head_branch,
+        "initial_remote_sha": "a" * 40,
+        "max_corrections": 3,
+        "corrections_used": 0,
+        "ttl_hours": 720.0,
+        "created_at": now.isoformat(),
+        "expires_at": (now + timedelta(hours=720)).isoformat(),
+        "status": "active",
+    }
+    file_path = _Path(auth_dir) / f"{auth_id}.json"
+    with open(file_path, "w") as f:
+        _json.dump(record, f)
+
+    return record
+
+
 # ---------------------------------------------------------------------------
 # Scenario 1 — Valid fast-forward correction
 # ---------------------------------------------------------------------------
@@ -110,6 +154,9 @@ class TestValidFastForward:
 
         # Step 2: Push to bare repo on branch hermes/test-001
         _, sha_a = _setup_bare_with_branch(bare, ws, "hermes/test-001")
+
+        # Create authorization for this push
+        _create_push_auth("", "caseclub-dev", "hermes-frontier-review-test", 1, "hermes/test-001")
 
         # Step 3: Add a second commit to workspace (descendant of SHA_A)
         env = {
@@ -253,6 +300,23 @@ class TestStaleRemoteSHA:
         # Push workspace B to bare repo as hermes/test-001
         bare = _create_bare_repo(tmp_path, "bare.git")
         _, sha_b_remote = _setup_bare_with_branch(bare, ws_b, "hermes/test-001")
+
+        # Create authorization with the remote SHA as initial
+        auth = _create_push_auth("", "caseclub-dev", "hermes-frontier-review-test", 1, "hermes/test-001")
+        if auth:
+            import json as _json
+            from pathlib import Path as _Path
+
+            # Update initial_remote_sha to match remote SHA so check passes
+            repo_dir = _Path(os.environ.get("FR_AUTH_DIR", "")) / "caseclub-dev__hermes-frontier-review-test"
+            pr_dir = repo_dir / "1"
+            auth_file = pr_dir / "auth-1.json"
+            if auth_file.exists():
+                with open(auth_file) as f:
+                    rec = _json.load(f)
+                rec["initial_remote_sha"] = sha_b_remote
+                with open(auth_file, "w") as f:
+                    _json.dump(rec, f)
 
         # Try to push workspace A with expected_remote_sha from workspace B.
         # Since A's history doesn't descend from B's commits, it should fail.
@@ -504,6 +568,9 @@ class TestDuplicatePublication:
         ws = _create_workspace(tmp_path, "ws")
         bare = _create_bare_repo(tmp_path, "bare.git")
         _, sha_a = _setup_bare_with_branch(bare, ws, "hermes/test-001")
+
+        # Create authorization for this push
+        _create_push_auth("", "caseclub-dev", "hermes-frontier-review-test", 1, "hermes/test-001")
 
         req = {
             "action": ACTION_PUSH,
@@ -845,6 +912,9 @@ class TestP1CBranchSafety:
         ws = _create_workspace(tmp_path, "ws")
         bare = _create_bare_repo(tmp_path, "bare_no_branch.git")  # Empty bare repo
 
+        # Create authorization — auth passes, then branch check fails
+        _create_push_auth("", "caseclub-dev", "hermes-frontier-review-test", 1, "hermes/new-branch")
+
         req = {
             "action": ACTION_PUSH,
             "repo_owner": "caseclub-dev",
@@ -864,6 +934,20 @@ class TestP1CBranchSafety:
         ws_a = _create_workspace(tmp_path, "ws_a")
         bare = _create_bare_repo(tmp_path, "bare_stale.git")
         _, sha_a = _setup_bare_with_branch(bare, ws_a, "hermes/test-001")
+
+        # Create authorization with initial_remote_sha matching remote HEAD
+        auth = _create_push_auth("", "caseclub-dev", "hermes-frontier-review-test", 2, "hermes/test-001")
+        if auth:
+            import json as _json
+            from pathlib import Path as _Path
+
+            auth_file = _Path(os.environ.get("FR_AUTH_DIR", "")) / "auth-caseclub-dev-hermes-frontier-review-test-2.json"
+            if auth_file.exists():
+                with open(auth_file) as f:
+                    rec = _json.load(f)
+                rec["initial_remote_sha"] = sha_a
+                with open(auth_file, "w") as f:
+                    _json.dump(rec, f)
 
         # Create workspace B with an unrelated commit chain.
         ws_b = _create_workspace(tmp_path, "ws_b", "separate v1\n")
@@ -936,6 +1020,9 @@ class TestP1CBranchSafety:
         bare = _create_bare_repo(tmp_path, "bare_ok.git")
         _, sha_a = _setup_bare_with_branch(bare, ws_a, "hermes/test-001")
 
+        # Create authorization for this push
+        _create_push_auth("", "caseclub-dev", "hermes-frontier-review-test", 4, "hermes/test-001")
+
         # Build descendant on same workspace.
         env = {
             "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@localhost",
@@ -973,6 +1060,9 @@ class TestP1CDuplicateHandling:
         ws_a = _create_workspace(tmp_path, "ws_a")
         bare = _create_bare_repo(tmp_path, "bare_dup.git")
         _, sha_a = _setup_bare_with_branch(bare, ws_a, "hermes/test-001")
+
+        # Create authorization for this push
+        _create_push_auth("", "caseclub-dev", "hermes-frontier-review-test", 4, "hermes/test-001")
 
         env = {
             "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@localhost",

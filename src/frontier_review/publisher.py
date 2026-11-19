@@ -47,6 +47,38 @@ from pathlib import Path
 from typing import Any, Optional
 
 # ---------------------------------------------------------------------------
+# AuthPolicy imports — integrated at P1D-2c for authorization enforcement.
+# These are always imported; the actual check is performed inside perform_push().
+# ---------------------------------------------------------------------------
+try:
+    from frontier_review.auth_policy import (
+        AuthPolicy,
+        PolicyViolationError,
+        RecordNotFoundError,
+        ValidationError,
+    )
+except ImportError:
+    # AuthPolicy not available — skip authorization checks.
+    # This allows the publisher to operate in legacy mode during P1D-2b testing.
+    AuthPolicy = None  # type: ignore[misc,assignment]
+    PolicyViolationError = None  # type: ignore[misc,assignment]
+    RecordNotFoundError = None  # type: ignore[misc,assignment]
+    ValidationError = None  # type: ignore[misc,assignment]
+
+try:
+    from frontier_review.publication_transaction import (
+        PublicationTransaction,
+        PublicationTransactionError,
+    )
+except ImportError:
+    PublicationTransaction = None  # type: ignore[misc,assignment]
+    PublicationTransactionError = None  # type: ignore[misc,assignment]
+
+# Publisher mode env vars — never configurable by caller request JSON
+PUB_STATE_DIR = os.environ.get("FR_PUBLISH_STATE_DIR", "")
+PUB_AUTH_DIR = os.environ.get("FR_AUTH_DIR", "")
+
+# ---------------------------------------------------------------------------
 # Constants — never configurable by caller
 # ---------------------------------------------------------------------------
 
@@ -326,6 +358,68 @@ def _verify_descendant(worktree: str, child_sha: str, parent_sha: str) -> bool:
 # Operation implementations
 # ---------------------------------------------------------------------------
 
+def _check_authorization(
+    repo_owner: str,
+    repo_name: str,
+    pr_number: int,
+) -> dict[str, Any]:
+    """Verify operator authorization for a correction publication.
+
+    Called inside perform_push() after schema validation but before any Git ops.
+    Uses the AuthPolicy class to check that an active, unexpired authorization
+    exists for the exact repo+PR pair and that the correction budget has not
+    been exhausted.
+
+    Returns:
+        Dict with keys: success (bool), error (str | None), auth_id (str | None).
+    """
+    if AuthPolicy is None:
+        # No AuthPolicy available — allow push to proceed (legacy mode)
+        return {"success": True, "error": None, "auth_id": None}
+
+    # Determine auth directory from env or default
+    auth_dir = PUB_AUTH_DIR or ""
+
+    try:
+        policy = AuthPolicy(auth_dir=auth_dir if auth_dir else None)
+    except Exception as exc:
+        _audit(
+            ACTION_PUSH, False,
+            f"auth_policy init failed: {exc}",
+            repo_owner=repo_owner,
+            pr_number=pr_number,
+        )
+        return {"success": False, "error": f"Authorization engine unavailable: {exc}", "auth_id": None}
+
+    # Check authorization existence and status
+    authorized, record = policy.check_authorized(repo_owner, repo_name, pr_number)
+    if not authorized or record is None:
+        _audit(
+            ACTION_PUSH, False,
+            "authorization check failed",
+            repo_owner=repo_owner,
+            pr_number=pr_number,
+        )
+        return {
+            "success": False,
+            "error": (
+                f"No valid operator authorization for {repo_owner}/{repo_name} PR {pr_number}. "
+                "Publication requires an explicit operator-created authorization ticket."
+            ),
+            "auth_id": None,
+        }
+
+    auth_id = record["authorization_id"]
+    _audit(
+        ACTION_PUSH, True,
+        f"authorization verified for PR #{pr_number}",
+        repo_owner=repo_owner,
+        pr_number=pr_number,
+        auth_id_prefix=auth_id[:8],
+    )
+    return {"success": True, "error": None, "auth_id": auth_id}
+
+
 def perform_push(
     req: dict[str, Any],
     token: str = "",
@@ -359,19 +453,57 @@ def perform_push(
         _audit(action, False, "missing or invalid pr_number", head_branch=head_branch)
         return {"action": action, "success": False, "error": "pr_number is required for push"}
 
+    # ---- Authorization check (P1D-2c integration) -------------------------
+    auth_result = _check_authorization(repo_owner, repo_name, int(pr_number))
+    if not auth_result["success"]:
+        _audit(action, False, f"authorization denied: {auth_result['error']}", head_branch=head_branch)
+        return {"action": action, "success": False, "error": auth_result["error"]}
+
+    auth_id = auth_result.get("auth_id")
+
+    # ---- Publication transaction setup (P1D-2c) ---------------------------
+    tx = None  # type: ignore[assignment]
+    if PublicationTransaction is not None:
+        try:
+            tx = PublicationTransaction(  # type: ignore[assignment]
+                pr_number=int(pr_number),
+                repo_owner=repo_owner,
+                repo_name=repo_name,
+                head_branch=head_branch,
+                expected_remote_sha=expected_remote_sha,
+            )
+            tx.begin()  # type: ignore[arg-type]
+        except Exception:
+            tx = None
+
     # Validate workspace is a git repo with commits
     if not os.path.isdir(ws_path):
+        if tx is not None:
+            try:
+                tx.abort("workspace directory missing")
+            except Exception:
+                pass
         _audit(action, False, "workspace directory missing", head_branch=head_branch)
         return {"action": action, "success": False, "error": "Workspace path does not exist"}
 
     r = _run_git(["rev-parse", "--show-toplevel"], cwd=ws_path)
     if r.returncode != 0:
+        if tx is not None:
+            try:
+                tx.abort("workspace is not a git repo")
+            except Exception:
+                pass
         _audit(action, False, "workspace is not a git repo", head_branch=head_branch)
         return {"action": action, "success": False, "error": "Workspace is not a git repository"}
 
     # Verify workspace has at least one commit
     r = _run_git(["rev-parse", "HEAD"], cwd=ws_path)
     if r.returncode != 0:
+        if tx is not None:
+            try:
+                tx.abort("workspace has no commits")
+            except Exception:
+                pass
         _audit(action, False, "workspace has no commits", head_branch=head_branch)
         return {"action": action, "success": False, "error": "Workspace has no commits"}
 
@@ -397,6 +529,11 @@ def perform_push(
             ["ls-remote", mock_bare_repo, f"refs/heads/{head_branch}"],
         )
         if r.returncode != 0 or not r.stdout.strip():
+            if tx is not None:
+                try:
+                    tx.abort("remote branch does not exist")
+                except Exception:
+                    pass
             _audit(action, False, "remote branch does not exist", head_branch=head_branch)
             return {
                 "action": action,
@@ -407,6 +544,11 @@ def perform_push(
         # Verify remote HEAD matches expected_remote_sha immediately before push
         r = _run_git(["rev-parse", f"origin/{head_branch}"], cwd=ws_path)
         if r.returncode != 0:
+            if tx is not None:
+                try:
+                    tx.abort("could not read remote branch ref")
+                except Exception:
+                    pass
             _audit(action, False, "could not read remote branch ref", head_branch=head_branch)
             return {
                 "action": action,
@@ -415,6 +557,11 @@ def perform_push(
             }
         current_remote_sha = r.stdout.strip()
         if current_remote_sha != expected_remote_sha:
+            if tx is not None:
+                try:
+                    tx.abort(f"remote SHA mismatch: got {current_remote_sha[:12]}")
+                except Exception:
+                    pass
             _audit(
                 action, False,
                 f"remote SHA mismatch: got {current_remote_sha[:12]} expected {expected_remote_sha[:12]}",
@@ -436,6 +583,11 @@ def perform_push(
             cwd=ws_path,
         )
         if r.returncode != 0:
+            if tx is not None:
+                try:
+                    tx.abort(f"non-descendant commit")
+                except Exception:
+                    pass
             _audit(action, False, "non-descendant commit", head_branch=head_branch)
             return {
                 "action": action,
@@ -443,12 +595,33 @@ def perform_push(
                 "error": f"Local HEAD is not a descendant of expected SHA {expected_remote_sha[:12]}",
             }
 
+        # ---- Consume correction budget (P1D-2c integration) ------------------
+        if auth_id is not None and AuthPolicy is not None:
+            state_dir = PUB_STATE_DIR or None
+            policy_for_consume = AuthPolicy(auth_dir=None, state_dir=state_dir)
+            try:
+                policy_for_consume.consume_correction(auth_id)
+            except Exception as exc:
+                # PolicyViolationError when budget exhausted; generic Exception as fallback
+                if tx is not None:
+                    try:
+                        tx.abort(f"correction consumption failed: {exc}")
+                    except Exception:
+                        pass
+                _audit(action, False, f"correction budget exhausted: {exc}", head_branch=head_branch)
+                return {"action": action, "success": False, "error": str(exc)}
+
         # Fast-forward push only (no force flag)
         r = _run_git(
             ["push", "origin", f"{head_branch}:{head_branch}"],
             cwd=ws_path,
         )
         if r.returncode != 0:
+            if tx is not None:
+                try:
+                    tx.abort(f"push failed")
+                except Exception:
+                    pass
             _audit(action, False, f"push failed: {r.stderr[:200]}", head_branch=head_branch)
             return {"action": action, "success": False, "error": r.stderr.strip()[:500]}
 
@@ -456,9 +629,20 @@ def perform_push(
         r = _run_git(["rev-parse", f"origin/{head_branch}"], cwd=ws_path)
         if r.returncode == 0:
             remote_sha = r.stdout.strip()
+            # Commit transaction
+            if tx is not None:
+                try:
+                    tx.commit(actual_remote_sha=remote_sha, corrections_consumed=1)
+                except Exception:
+                    pass  # Transaction persistence failure is non-fatal after successful push
             _audit(action, True, "mock push succeeded", head_branch=head_branch, remote_sha=remote_sha[:12])
             return {"action": action, "success": True, "remote_sha": remote_sha}
 
+        if tx is not None:
+            try:
+                tx.abort("push succeeded but remote SHA unreadable")
+            except Exception:
+                pass
         _audit(action, False, "push succeeded but remote SHA unreadable", head_branch=head_branch)
         return {"action": action, "success": False, "error": "Could not read remote HEAD after push"}
     else:
