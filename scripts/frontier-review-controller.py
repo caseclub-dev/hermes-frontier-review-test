@@ -118,14 +118,18 @@ def _create_transport_from_env(task_id: str = "", ledger_path: str = "") -> Mock
     else:
         transport.configure_sequence(scenarios)
 
-    # Persist consumed scenario count to ledger for cross-invocation tracking
+    # Persist consumed scenario count to ledger for cross-invocation tracking.
+    # This is the SINGLE persistence point — writing AFTER transport configuration
+    # ensures we persist the exact index that was consumed, and doing it here
+    # (before run() which may write other fields) prevents overwrite conflicts.
     if task_id and ledger_path and scenarios:
         try:
             with open(ledger_path) as f:
-                ledger = json.load(f)
-            ledger.setdefault(task_id, {})["_mock_scenario_index"] = start_idx + len(scenarios)
+                ldata = json.load(f)
+            task_data = ldata.setdefault(task_id, {})
+            task_data["_mock_scenario_index"] = start_idx + len(scenarios)
             with open(ledger_path, "w") as f:
-                json.dump(ledger, f, indent=2)
+                json.dump(ldata, f, indent=2)
         except Exception:
             pass  # non-critical — don't break controller on ledger write failure
 

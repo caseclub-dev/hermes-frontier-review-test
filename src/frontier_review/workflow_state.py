@@ -44,6 +44,7 @@ class TaskRecord:
     correction_count: int = 0
     max_correction_cycles: int = 3
     max_review_dispatches: int = 4
+    review_count: int = 0
     final_disposition: str = ""
     total_mock_cost_usd: float = 0.0
     created_at: str = field(
@@ -409,6 +410,10 @@ class WorkflowLedger:
         rec = self._data[task_id]
         total_cost = rec.get("total_mock_cost_usd", 0.0) + token_cost
         seq = rec.setdefault("review_sequence", [])
+        # Increment review_count: exactly one per successful record_review call
+        # (not for discovery checks, push retries, or duplicate rejections)
+        review_cnt = rec.get("review_count", 0)
+        rec["review_count"] = review_cnt + 1
         seq.append({
             "type": "review",
             "status": review_status,

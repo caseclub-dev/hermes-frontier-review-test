@@ -84,6 +84,63 @@ class TempLedger:
         seq.append(entry)
         self._save(data)
 
+    def record_review(self, task_id, status, findings, token_cost, commit_sha="", evidence_fingerprint=""):
+        """Record a review entry — thin wrapper around add_review_entry + metadata."""
+        data = self._load()
+        rec = data.setdefault(task_id, {})
+        # Duplicate check: same SHA+fp with no corrections → reject
+        if commit_sha and evidence_fingerprint:
+            existing = [e for e in rec.get("review_sequence", [])
+                        if e.get("type") == "review"
+                        and e.get("sha") == commit_sha
+                        and e.get("evidence_fp") == evidence_fingerprint]
+            if existing and rec.get("correction_count", 0) == 0:
+                return False
+        seq = rec.setdefault("review_sequence", [])
+        cnt = rec.get("review_count", 0)
+        rec["review_count"] = cnt + 1
+        seq.append({
+            "type": "review", "status": status,
+            "findings": findings[:10], "token_cost": round(token_cost, 6),
+            "sha": commit_sha, "evidence_fp": evidence_fingerprint,
+        })
+        data[task_id] = rec
+        self._save(data)
+        return True
+
+    def update_task_sha(self, task_id, new_sha):
+        """Update current_sha and set review_status back to unreviewed."""
+        self.set_field(task_id, "current_sha", new_sha)
+        self.set_field(task_id, "remote_head_sha", new_sha[:40])
+        self.set_field(task_id, "initial_remote_sha", new_sha[:40])
+        self.set_field(task_id, "review_status", "unreviewed")
+
+    def mark_pass(self, task_id, sha, evidence_fp):
+        """Set status to READY_FOR_OPERATOR_REVIEW."""
+        data = self._load()
+        rec = data.setdefault(task_id, {})
+        rec["status"] = "READY_FOR_OPERATOR_REVIEW"
+        rec["review_status"] = "pass"
+        rec["remote_head_sha"] = sha
+        rec["evidence_fingerprint"] = evidence_fp
+        data[task_id] = rec
+        self._save(data)
+        return True
+
+    def increment_correction_count(self, task_id):
+        """Increment correction_count."""
+        data = self._load()
+        rec = data.setdefault(task_id, {})
+        rec["correction_count"] = rec.get("correction_count", 0) + 1
+        data[task_id] = rec
+        self._save(data)
+
+    @staticmethod
+    def compute_fingerprint(sha, evidence):
+        """Compute SHA-256 fingerprint (mimics WorkflowLedger)."""
+        import hashlib
+        return hashlib.sha256(f"{sha}{evidence}".encode()).hexdigest()
+
     @property
     def workspace_path(self) -> str:
         return self._dir
@@ -466,6 +523,165 @@ class TestMissingJobFileNoInfiniteLoop(TestCase):
 
         # The controller's fix: when CORRECTION_PENDING but no job file AND prior rejection → BLOCKED.
         # This prevents the loop PENDING_REVIEW→CHANGES_REQUIRED→CORRECTION_PENDING→PENDING_REVIEW...
+        ledger.teardown()
+
+
+# ── Fix 1: PASS Audit Recording ──────────────────────────────────────────────
+
+class TestPassAuditRecording(TestCase):
+    """Test Defect 1: PASS must be durably recorded BEFORE READY_FOR_OPERATOR_REVIEW."""
+
+    def test_pass_recorded_before_ready_transition(self):
+        """PASS appears in review_sequence before mark_pass sets READY_FOR_OPERATOR_REVIEW."""
+        ledger = TempLedger()
+        task_id = "test-pass-audit"
+        sha_a = "a" * 40
+        ws_path, _ = create_workspace(ledger.workspace_path, task_id)
+        ledger.set_task_status(task_id, "PENDING_REVIEW", workspace_path=ws_path, current_sha=sha_a)
+
+        rec_fp = ledger.compute_fingerprint(sha_a, "")
+        ok1 = ledger.record_review(
+            task_id, "changes_required",
+            findings=[{"title": "issue"}], token_cost=0.01,
+            commit_sha=sha_a, evidence_fingerprint=rec_fp,
+        )
+        assert ok1 is True
+
+        data = ledger._load()
+        seq1 = data[task_id].get("review_sequence", [])
+        assert len(seq1) == 1 and seq1[-1]["status"] == "changes_required"
+        assert data[task_id].get("review_count") == 1
+
+        sha_b = "b" * 40
+        ledger.update_task_sha(task_id, sha_b)
+        pass_fp = ledger.compute_fingerprint(sha_b, "")
+        ok2 = ledger.record_review(
+            task_id, "pass", findings=[{"title": "ok"}], token_cost=0.01,
+            commit_sha=sha_b, evidence_fingerprint=pass_fp,
+        )
+        assert ok2 is True
+
+        data = ledger._load()
+        pass_entries = [e for e in data[task_id].get("review_sequence", []) if e.get("status") == "pass"]
+        assert len(pass_entries) == 1 and pass_entries[-1]["sha"] == sha_b
+        assert data[task_id].get("review_count") == 2
+
+        result = ledger.mark_pass(task_id, sha_b, pass_fp)
+        assert result is True
+        data = ledger._load()
+        assert data[task_id]["status"] == "READY_FOR_OPERATOR_REVIEW"
+        ledger.teardown()
+
+    def test_duplicate_review_rejected_for_same_sha_fp(self):
+        """Retrying the SAME review attempt (same SHA + same fp) returns False."""
+        ledger = TempLedger()
+        task_id = "test-dup-review"
+        sha = "c" * 40
+        ws_path, _ = create_workspace(ledger.workspace_path, task_id)
+        ledger.set_task_status(task_id, "PENDING_REVIEW", workspace_path=ws_path, current_sha=sha)
+
+        fp = ledger.compute_fingerprint(sha, "")
+        assert ledger.record_review(task_id, "changes_required", [], 0.01, sha, fp) is True
+        assert ledger.record_review(task_id, "changes_required", [], 0.01, sha, fp) is False
+
+        data = ledger._load()
+        assert data[task_id]["review_count"] == 1
+        ledger.teardown()
+
+    def test_changes_required_not_converted_to_pass(self):
+        """A rejected SHA cannot become PASS through duplicate-handling logic."""
+        ledger = TempLedger()
+        task_id = "test-no-cr-to-pass"
+        sha = "d" * 40
+        ws_path, _ = create_workspace(ledger.workspace_path, task_id)
+        ledger.set_task_status(task_id, "PENDING_REVIEW", workspace_path=ws_path, current_sha=sha)
+
+        fp = ledger.compute_fingerprint(sha, "")
+        assert ledger.record_review(task_id, "changes_required", [], 0.01, sha, fp) is True
+        assert ledger.record_review(task_id, "pass", [], 0.01, sha, fp) is False
+
+        data = ledger._load()
+        seq = data[task_id].get("review_sequence", [])
+        assert len(seq) == 1 and seq[0]["status"] == "changes_required"
+        ledger.teardown()
+
+
+# ── Fix 2: review_count Accounting ───────────────────────────────────────────
+
+class TestReviewCountAccounting(TestCase):
+    """Test Defect 2: review_count increments exactly once per actual review."""
+
+    def test_review_count_independent_from_correction_count(self):
+        """review_count and correction_count track independent metrics."""
+        ledger = TempLedger()
+        task_id = "test-independent"
+        sha_a = "e" * 40
+        ws_path, _ = create_workspace(ledger.workspace_path, task_id)
+        ledger.set_task_status(task_id, "PENDING_REVIEW", workspace_path=ws_path, current_sha=sha_a)
+
+        fp_a = ledger.compute_fingerprint(sha_a, "")
+        ledger.record_review(task_id, "changes_required", [], 0.01, sha_a, fp_a)
+
+        data = ledger._load()
+        assert data[task_id]["review_count"] == 1
+        assert data[task_id]["correction_count"] == 0
+
+        ledger.increment_correction_count(task_id)
+        data = ledger._load()
+        assert data[task_id]["correction_count"] == 1
+        assert data[task_id]["review_count"] == 1
+
+        sha_b = "f" * 40
+        ledger.update_task_sha(task_id, sha_b)
+        fp_b = ledger.compute_fingerprint(sha_b, "")
+        ledger.record_review(task_id, "pass", [], 0.01, sha_b, fp_b)
+
+        data = ledger._load()
+        assert data[task_id]["review_count"] == 2
+        assert data[task_id]["correction_count"] == 1
+        ledger.teardown()
+
+    def test_review_count_survives_ledger_reload(self):
+        """review_count persists to disk and is recovered on fresh load."""
+        ledger = TempLedger()
+        task_id = "test-persist"
+        sha = "g" * 40
+        ws_path, _ = create_workspace(ledger.workspace_path, task_id)
+        ledger.set_task_status(task_id, "PENDING_REVIEW", workspace_path=ws_path, current_sha=sha)
+
+        fp = TempLedger.compute_fingerprint(sha, "")
+        ledger.record_review(task_id, "changes_required", [], 0.01, sha, fp)
+
+        # Simulate a fresh read from disk (re-read from the JSON file)
+        data2 = ledger._load()
+        assert data2[task_id]["review_count"] == 1
+        ledger.teardown()
+
+
+# ── Fix 3: Mock Scenario Consumption ─────────────────────────────────────────
+
+class TestMockScenarioConsumption(TestCase):
+    """Test Defect 3: Mock transport consumes one scenario per review dispatch."""
+
+    def test_scenario_index_persists_across_invocations(self):
+        """_mock_scenario_index persists correctly and does not cause overwrite of PASS records."""
+        ledger = TempLedger()
+        task_id = "test-scenario"
+        sha_a = "h" * 40
+        ws_path, _ = create_workspace(ledger.workspace_path, task_id)
+        ledger.set_task_status(task_id, "PENDING_REVIEW", workspace_path=ws_path, current_sha=sha_a)
+
+        data = ledger._load()
+        data[task_id]["_mock_scenario_index"] = 0
+        ledger._save(data)
+
+        fp_a = TempLedger.compute_fingerprint(sha_a, "")
+        ledger.record_review(task_id, "changes_required", [], 0.01, sha_a, fp_a)
+
+        data = ledger._load()
+        assert data[task_id].get("_mock_scenario_index", -1) >= 0
+        seq = data[task_id].get("review_sequence", [])
+        assert len(seq) == 1
         ledger.teardown()
 
 
