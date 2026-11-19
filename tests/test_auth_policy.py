@@ -6,17 +6,19 @@ atomic writes, and the CLI entry point.
 
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
 import uuid
+from pathlib import Path
 
 import pytest
 
 # Ensure the source tree is on the path so imports work
-SRC_ROOT = os.path.join(os.path.dirname(__file__), "..", "src")
-if SRC_ROOT not in sys.path:
-    sys.path.insert(0, SRC_ROOT)
+SRC_ROOT = Path(__file__).parent.parent / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
 
 from frontier_review.auth_policy import (
     AuthPolicy,
@@ -368,9 +370,11 @@ def test_cli_authorize_success():
     """Test 25: CLI with valid args; stdout is valid JSON."""
     env = os.environ.copy()
     # Point FR_AUTH_DIR at a temp directory
-    tmpdir = "/tmp/fr_auth_cli_test_25"
+    tmpdir = f"/tmp/fr_auth_cli_test_25_{uuid.uuid4().hex[:8]}"
     os.makedirs(tmpdir, exist_ok=True)
     env["FR_AUTH_DIR"] = tmpdir
+    # Ensure the source tree is importable for the subprocess
+    env["PYTHONPATH"] = str(SRC_ROOT)
 
     result = subprocess.run(
         [sys.executable, "-m", "frontier_review.auth_policy",
@@ -387,34 +391,32 @@ def test_cli_authorize_success():
     assert data["pr_number"] == 50
 
     # Cleanup
-    import shutil
     shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def test_cli_list_empty():
     """Test 26: CLI list no records; stdout is '[]'."""
-    tmpdir = "/tmp/fr_auth_cli_test_26"
+    tmpdir = f"/tmp/fr_auth_cli_test_26_{uuid.uuid4().hex[:8]}"
     os.makedirs(tmpdir, exist_ok=True)
 
+    env = {**os.environ, "FR_AUTH_DIR": tmpdir, "PYTHONPATH": str(SRC_ROOT)}
     result = subprocess.run(
         [sys.executable, "-m", "frontier_review.auth_policy", "list"],
-        capture_output=True, text=True,
-        env={**os.environ, "FR_AUTH_DIR": tmpdir},
+        capture_output=True, text=True, env=env,
     )
     assert result.returncode == 0
     data = json.loads(result.stdout)
     assert data == []
 
-    import shutil
     shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def test_cli_revoke_by_id():
     """Test 27: Create via AuthPolicy, revoke via CLI; verify status updated."""
     import shutil
-    tmpdir = "/tmp/fr_auth_cli_test_27"
+    tmpdir = f"/tmp/fr_auth_cli_test_27_{uuid.uuid4().hex[:8]}"
     os.makedirs(tmpdir, exist_ok=True)
-    env = {**os.environ, "FR_AUTH_DIR": tmpdir}
+    env = {**os.environ, "FR_AUTH_DIR": tmpdir, "PYTHONPATH": str(SRC_ROOT)}
 
     # Create a record via policy API
     policy = AuthPolicy(tmpdir)

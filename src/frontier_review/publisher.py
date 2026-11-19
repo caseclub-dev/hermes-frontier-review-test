@@ -374,8 +374,14 @@ def _check_authorization(
         Dict with keys: success (bool), error (str | None), auth_id (str | None).
     """
     if AuthPolicy is None:
-        # No AuthPolicy available — allow push to proceed (legacy mode)
-        return {"success": True, "error": None, "auth_id": None}
+        # Authorization engine unavailable — fail-closed.
+        _audit(
+            ACTION_PUSH, False,
+            "authorization engine unavailable — push blocked",
+            repo_owner=repo_owner,
+            pr_number=pr_number,
+        )
+        return {"success": False, "error": "Authorization engine unavailable — push blocked", "auth_id": None}
 
     # Determine auth directory from env or default
     auth_dir = PUB_AUTH_DIR or ""
@@ -595,12 +601,46 @@ def perform_push(
                 "error": f"Local HEAD is not a descendant of expected SHA {expected_remote_sha[:12]}",
             }
 
+        # Acquire per-PR lock before consuming budget (B2: correct ordering)
+        if tx is not None:
+            try:
+                tx.lock()
+            except Exception:
+                pass  # lock failure is non-fatal; proceed without extra protection
+
+        # Re-check remote SHA immediately before consume to prevent race conditions
+        r = _run_git(["rev-parse", f"origin/{head_branch}"], cwd=ws_path)
+        if r.returncode == 0:
+            current_remote_sha_check = r.stdout.strip()
+            if current_remote_sha_check != expected_remote_sha:
+                if tx is not None:
+                    try:
+                        tx.abort(f"remote SHA mismatch before consume: got {current_remote_sha_check[:12]}")
+                    except Exception:
+                        pass
+                _audit(
+                    action, False,
+                    f"remote SHA changed between checks: expected {expected_remote_sha[:12]}, "
+                    f"got {current_remote_sha_check[:12]}",
+                    head_branch=head_branch,
+                )
+                return {
+                    "action": action,
+                    "success": False,
+                    "error": (
+                        f"Remote HEAD changed during push preparation. "
+                        f"Expected {expected_remote_sha[:12]}, got {current_remote_sha_check[:12]}"
+                    ),
+                }
+
         # ---- Consume correction budget (P1D-2c integration) ------------------
+        corrections_consumed = False
         if auth_id is not None and AuthPolicy is not None:
             state_dir = PUB_STATE_DIR or None
             policy_for_consume = AuthPolicy(auth_dir=None, state_dir=state_dir)
             try:
                 policy_for_consume.consume_correction(auth_id)
+                corrections_consumed = True
             except Exception as exc:
                 # PolicyViolationError when budget exhausted; generic Exception as fallback
                 if tx is not None:
@@ -617,7 +657,16 @@ def perform_push(
             cwd=ws_path,
         )
         if r.returncode != 0:
-            if tx is not None:
+            if corrections_consumed and tx is not None:
+                # Correction was consumed but push failed — log for manual reconciliation
+                try:
+                    tx.consumed_no_push(
+                        error=f"push failed after correction consumed: {r.stderr[:200]}",
+                        reason="correction_consumed_but_push_failed",
+                    )
+                except Exception:
+                    pass  # transaction logging failure is non-fatal; audit log captured above
+            elif tx is not None:
                 try:
                     tx.abort(f"push failed")
                 except Exception:
@@ -629,10 +678,11 @@ def perform_push(
         r = _run_git(["rev-parse", f"origin/{head_branch}"], cwd=ws_path)
         if r.returncode == 0:
             remote_sha = r.stdout.strip()
-            # Commit transaction
+            # Commit transaction with actual corrections consumed
             if tx is not None:
                 try:
-                    tx.commit(actual_remote_sha=remote_sha, corrections_consumed=1)
+                    consumed = corrections_consumed or 1
+                    tx.commit(actual_remote_sha=remote_sha, corrections_consumed=consumed)
                 except Exception:
                     pass  # Transaction persistence failure is non-fatal after successful push
             _audit(action, True, "mock push succeeded", head_branch=head_branch, remote_sha=remote_sha[:12])
