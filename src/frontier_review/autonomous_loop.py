@@ -46,7 +46,7 @@ from .transport import (
     ScenarioConfig,
     TransportError,
 )
-from .workflow_state import TaskRecord, WorkflowLedger, WorkflowState
+from .workflow_state import TaskRecord, WorkflowLedger, WorkflowState, default_ledger_path
 
 logger = logging.getLogger(__name__)
 
@@ -130,7 +130,7 @@ class AutonomousCorrectionLoop:
             self.state_dir = state_dir
 
         # Initialize ledger and client
-        self.ledger_path = os.path.join(self.state_dir, "workflow_ledger.json")
+        self.ledger_path = default_ledger_path(self.state_dir)
         self.ledger = WorkflowLedger(self.ledger_path)
         self.client = AnthropicClient(model=ALLOWED_MODEL)
 

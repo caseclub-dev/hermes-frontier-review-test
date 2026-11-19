@@ -45,7 +45,11 @@ from frontier_review.pr_adapter import (
     verify_approval_prerequisites,
 )
 from frontier_review.transport import MockAnthropicTransport, ScenarioConfig
-from frontier_review.workflow_state import WorkflowLedger, TaskRecord
+from frontier_review.workflow_state import (
+    WorkflowLedger,
+    default_ledger_path,
+    TaskRecord,
+)
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -384,7 +388,7 @@ def _process_pr_once(
     """
     import fcntl
 
-    ledger_path = os.path.join(state_dir, "workflow_ledger.json")
+    ledger_path = default_ledger_path(state_dir)
     registry = PRRegistry(ledger_path)
     if allowlist:
         registry.set_allowlist(allowlist)
@@ -725,7 +729,7 @@ def main() -> int:
         state_dir = os.path.join(home, ".hermes", "frontier_review_state")
     os.makedirs(state_dir, exist_ok=True)
 
-    ledger_path = os.path.join(state_dir, "workflow_ledger.json")
+    ledger_path = default_ledger_path(state_dir)
     ledger = WorkflowLedger(ledger_path)
 
     if args.once:

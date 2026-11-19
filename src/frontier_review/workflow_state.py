@@ -16,6 +16,16 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 
+# ── Shared ledger configuration ────────────────────────────────────────
+# All components (controller, PR adapter, autonomous loop) MUST use this
+# constant for the ledger filename to prevent cross-file state divergence.
+LEDGER_FILENAME = "workflow_ledger.json"
+
+
+def default_ledger_path(state_dir: str) -> str:
+    """Return the canonical path to the workflow ledger file."""
+    return os.path.join(state_dir, LEDGER_FILENAME)
+
 
 # ── Data models ────────────────────────────────────────────────────────
 

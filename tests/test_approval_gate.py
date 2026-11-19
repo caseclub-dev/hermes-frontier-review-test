@@ -100,7 +100,7 @@ def test_missing_review_record():
         state_dir = os.path.join(tmpdir, "state")
 
         # Manually create ledger task but leave it without any reviews.
-        ledger = WorkflowLedger(os.path.join(state_dir, "ledger.json"))
+        ledger = WorkflowLedger(os.path.join(state_dir, "workflow_ledger.json"))
         ledger.create_task(
             task_id="no-review-abc123",
             requirements="Test code.",
@@ -159,7 +159,7 @@ def test_wrong_workspace_path():
     """Ledger with different workspace_path than expected → blocked."""
     tmpdir = _tmpdir("wrong_ws")
     try:
-        ledger_path = os.path.join(tmpdir, "ledger.json")
+        ledger_path = os.path.join(tmpdir, "workflow_ledger.json")
         ws_actual = os.path.join(tmpdir, "actual_ws")
         ws_expected = os.path.join(tmpdir, "expected_ws")
         os.makedirs(ws_actual)
@@ -210,7 +210,7 @@ def test_changed_commit_sha():
     """PASS review on old SHA is rejected when expecting new SHA."""
     tmpdir = _tmpdir("sha_mismatch")
     try:
-        ledger_path = os.path.join(tmpdir, "ledger.json")
+        ledger_path = os.path.join(tmpdir, "workflow_ledger.json")
         ws = os.path.join(tmpdir, "ws")
         os.makedirs(ws)
 
@@ -262,7 +262,7 @@ def test_changes_required_not_pass():
     """Only a PASS review authorizes READY; CHANGES_REQUIRED blocks."""
     tmpdir = _tmpdir("not_pass")
     try:
-        ledger_path = os.path.join(tmpdir, "ledger.json")
+        ledger_path = os.path.join(tmpdir, "workflow_ledger.json")
         ws = os.path.join(tmpdir, "ws")
         os.makedirs(ws)
 
@@ -306,7 +306,7 @@ def test_changed_test_evidence():
     """Evidence fingerprint mismatch after code change → blocked."""
     tmpdir = _tmpdir("evidence_change")
     try:
-        ledger_path = os.path.join(tmpdir, "ledger.json")
+        ledger_path = os.path.join(tmpdir, "workflow_ledger.json")
         ws = os.path.join(tmpdir, "ws")
         os.makedirs(ws)
 
@@ -361,7 +361,7 @@ def test_validate_rejects_missing_task():
     """Validation raises ValueError for non-existent tasks — no false approval."""
     tmpdir = _tmpdir("missing_task")
     try:
-        ledger_path = os.path.join(tmpdir, "ledger.json")
+        ledger_path = os.path.join(tmpdir, "workflow_ledger.json")
         ws = os.path.join(tmpdir, "ws")
         os.makedirs(ws)
 
@@ -436,7 +436,7 @@ def test_pass_after_changes_required_is_valid():
     """PASS on corrected code (new SHA) is valid after CHANGES_REQUIRED."""
     tmpdir = _tmpdir("pass_after_cr")
     try:
-        ledger_path = os.path.join(tmpdir, "ledger.json")
+        ledger_path = os.path.join(tmpdir, "workflow_ledger.json")
         ws = os.path.join(tmpdir, "ws")
         os.makedirs(ws)
 
@@ -538,7 +538,7 @@ def test_stale_pass_wrong_sha():
     """PASS record from old SHA is rejected when current SHA differs."""
     tmpdir = _tmpdir("stale_sha")
     try:
-        ledger_path = os.path.join(tmpdir, "ledger.json")
+        ledger_path = os.path.join(tmpdir, "workflow_ledger.json")
         ws = os.path.join(tmpdir, "ws")
         os.makedirs(ws)
 
@@ -583,7 +583,7 @@ def test_blocked_disposition_blocks_approval():
     """A review with BLOCKED status is never approved."""
     tmpdir = _tmpdir("blocked_status")
     try:
-        ledger_path = os.path.join(tmpdir, "ledger.json")
+        ledger_path = os.path.join(tmpdir, "workflow_ledger.json")
         ws = os.path.join(tmpdir, "ws")
         os.makedirs(ws)
 
@@ -627,7 +627,7 @@ def test_latest_pass_only():
     """If a later review is CHANGES_REQUIRED, it overrides an earlier PASS."""
     tmpdir = _tmpdir("override_pass")
     try:
-        ledger_path = os.path.join(tmpdir, "ledger.json")
+        ledger_path = os.path.join(tmpdir, "workflow_ledger.json")
         ws = os.path.join(tmpdir, "ws")
         os.makedirs(ws)
 
