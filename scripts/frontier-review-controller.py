@@ -60,23 +60,45 @@ def _json_line(data: dict) -> None:
     print(json.dumps(data, default=str))
 
 
-def _create_transport_from_env() -> MockAnthropicTransport:
+def _create_transport_from_env(task_id: str = "", ledger_path: str = "") -> MockAnthropicTransport:
     """Build a transport from FR_REVIEW_SEQUENCE env var or default PASS.
 
-    Expected format: JSON array like ["changes_required","pass"] or just ["pass"].
-    """
-    seq_str = os.environ.get("FR_REVIEW_SEQUENCE", '["pass"]')
-    try:
-        sequence = json.loads(seq_str)
-    except json.JSONDecodeError:
-        logger.warning(f"Invalid FR_REVIEW_SEQUENCE: {seq_str!r}, defaulting to [\"pass\"]")
-        sequence = ["pass"]
+    Expected format: JSON array like [\"changes_required\",\"pass\"] or just [\"pass\"].
 
-    if not sequence:
-        sequence = ["pass"]
+    When task_id and ledger_path are provided, persists consumed scenario index
+    in the ledger so scenarios advance across controller invocations.
+    """
+    seq_str = os.environ.get("FR_REVIEW_SEQUENCE", '[\"pass\"]')
+    try:
+        full_sequence = json.loads(seq_str)
+    except json.JSONDecodeError:
+        logger.warning(f"Invalid FR_REVIEW_SEQUENCE: {seq_str!r}, defaulting to [\\\"pass\\\"]")
+        full_sequence = ["pass"]
+
+    if not full_sequence:
+        full_sequence = ["pass"]
+
+    # Determine starting index from ledger (persists across invocations)
+    start_idx = 0
+    remaining_seq = list(full_sequence)
+    if task_id and ledger_path:
+        try:
+            with open(ledger_path) as f:
+                ledger = json.load(f)
+            idx_key = "_mock_scenario_index"
+            idx = ledger.get(task_id, {}).get(idx_key, 0)
+            start_idx = int(idx)
+            if start_idx >= len(full_sequence):
+                # Sequence exhausted — reset to full sequence for re-reviews
+                start_idx = 0
+                remaining_seq = list(full_sequence)
+            else:
+                remaining_seq = full_sequence[start_idx:]
+        except Exception as e:
+            logger.debug(f"Could not read scenario index from ledger: {e}")
 
     scenarios = []
-    for status in sequence:
+    for status in remaining_seq:
         status_lower = status.lower()
         if status_lower == "pass":
             scenarios.append(MockAnthropicTransport.ok_response(status="pass"))
@@ -95,7 +117,65 @@ def _create_transport_from_env() -> MockAnthropicTransport:
         transport.configure(scenarios[0])
     else:
         transport.configure_sequence(scenarios)
+
+    # Persist consumed scenario count to ledger for cross-invocation tracking
+    if task_id and ledger_path and scenarios:
+        try:
+            with open(ledger_path) as f:
+                ledger = json.load(f)
+            ledger.setdefault(task_id, {})["_mock_scenario_index"] = start_idx + len(scenarios)
+            with open(ledger_path, "w") as f:
+                json.dump(ledger, f, indent=2)
+        except Exception:
+            pass  # non-critical — don't break controller on ledger write failure
+
     return transport
+
+
+def _archive_correction_job(job_path: str, task_id: str, ws_path: str) -> str:
+    """Archive a correction job file for audit evidence.
+
+    Moves the job file to an archive directory rather than deleting it,
+    preserving complete history of all dispatch attempts regardless of outcome.
+
+    Returns the archived path or empty string on failure.
+    """
+    try:
+        import shutil
+        archive_dir = os.path.join(ws_path, "correction_jobs_archive", task_id)
+        os.makedirs(archive_dir, exist_ok=True)
+        basename = os.path.basename(job_path)
+        import time as _time_mod
+        archived_name = f"{_time_mod.time():.0f}_{basename}"
+        dest = os.path.join(archive_dir, archived_name)
+        shutil.move(job_path, dest)
+        return dest
+    except Exception as e:
+        logger.warning(f"Failed to archive correction job {job_path}: {e}")
+        return ""
+
+
+def _archive_orphaned_jobs(task_id: str, ws_path: str) -> None:
+    """Archive any orphaned correction job files for audit evidence.
+
+    Called when CORRECTION_PENDING has no matching job file — all remaining
+    jobs in the task's directory are stale and should be preserved as history.
+    """
+    try:
+        import shutil
+        old_dir = os.path.join(ws_path, "correction_jobs", task_id)
+        if os.path.isdir(old_dir):
+            _archive_correction_job(
+                os.path.join(old_dir, ""),
+                task_id, ws_path,
+            )
+            # Move entire directory to archive
+            archive_dir = os.path.join(ws_path, "correction_jobs_archive", task_id)
+            os.makedirs(archive_dir, exist_ok=True)
+            shutil.move(old_dir, archive_dir)
+    except Exception as e:
+        logger.warning(f"Failed to archive orphaned jobs for {task_id}: {e}")
+
 
 
 def _process_once(
@@ -175,16 +255,54 @@ def _process_once(
         ledger.release_task(task_id, reason="no_git_commits")
         return 1
 
-    # Check if this task already has a pending correction job file (re-entry from prior run).
-    # In that case, skip the full review loop and go straight to real Coder correction.
+    # ── Correction job file validation (Phase 3B) ────────────────
+    # A correction job file is only valid if the ledger confirms
+    # CORRECTION_PENDING.  Stale files from prior runs must NOT
+    # trigger Coder — ledger state is authoritative.
     loop_for_check = AutonomousCorrectionLoop(
         workspace_path=ws_path, state_dir=state_dir,
     )
     job_file = loop_for_check._correction_job_path(task_id)
 
-    if claimed.status == "CORRECTION_PENDING" or os.path.isfile(job_file):
+    should_dispatch_correction = False
+    if claimed.status == "CORRECTION_PENDING":
+        # Validate the job file exists and matches ledger data.
+        # If it does not exist or is corrupted, archive it as audit evidence.
+        if os.path.isfile(job_file):
+            try:
+                with open(job_file) as jf:
+                    import json as _json_module
+                    job_data = _json_module.load(jf)
+                if (job_data.get("task_id") == task_id and
+                        job_data.get("current_sha") == claimed.current_sha):
+                    should_dispatch_correction = True
+                else:
+                    logger.warning(
+                        f"[{task_id}] Correction job metadata mismatch — "
+                        f"archiving (ledger sha={claimed.current_sha}, "
+                        f"file task_id={job_data.get('task_id')}, "
+                        f"file sha={job_data.get('current_sha')})"
+                    )
+                    # Archive for audit evidence
+                    _archive_correction_job(job_file, task_id, ws_path)
+            except Exception:
+                logger.warning(
+                    f"[{task_id}] Cannot read correction job file — "
+                    f"archiving as audit evidence"
+                )
+                _archive_correction_job(job_file, task_id, ws_path)
+        else:
+            # No job file but ledger says CORRECTION_PENDING — stale state.
+            logger.warning(
+                f"[{task_id}] CORRECTION_PENDING without job file "
+                f"— archiving any orphaned jobs and transitioning to PENDING_REVIEW"
+            )
+            _archive_orphaned_jobs(task_id, ws_path)
+            loop_for_check.ledger.set_task_status(task_id, "PENDING_REVIEW")
+
+    if should_dispatch_correction:
         # ── Direct correction dispatch (Phase 3B) ────────────────
-        logger.info(f"[{task_id}] Correction job detected — dispatching real Coder (Phase 3B)")
+        logger.info(f"[{task_id}] Correction job validated — dispatching real Coder (Phase 3B)")
         _json_line({
             "action": "correction_dispatch",
             "task_id": task_id,
@@ -200,6 +318,8 @@ def _process_once(
         )
 
         if result["success"]:
+            # Archive the completed job file for audit evidence
+            _archive_correction_job(job_file, task_id, ws_path)
             # Transition back to PENDING_REVIEW for re-evaluation
             loop_for_check.ledger.set_task_status(task_id, "PENDING_REVIEW")
             _json_line({
@@ -439,9 +559,191 @@ def _process_pr_once(
                 continue
 
             try:
-                # Build review context — NO credentials included
+                # ── Push-state reconciliation (Blocker 1 recovery) ─────────────
+                # Must run BEFORE the review pipeline to avoid consuming mock
+                # scenarios on stale/lost-push state.
+                ws_path = claimed.workspace_path or "/tmp"
+                raw_claim = registry._ledger._data.get(task_id, {})
+                push_error = raw_claim.get("push_error") or ""
+                is_correction_pending = raw_claim.get("status") == "CORRECTION_PENDING"
+
+                sha_stale = False
+                if claimed.workspace_path:
+                    try:
+                        r_check = subprocess.run(
+                            ["git", "rev-parse", "--short=12", "HEAD"],
+                            capture_output=True, text=True, timeout=5,
+                            cwd=claimed.workspace_path,
+                        )
+                        local_head = r_check.stdout.strip()
+                        gh_cl_quick = GitHubClient(
+                            repo_owner=pr_info.get("repo_owner", ""),
+                            repo_name=pr_info.get("repo_name", ""),
+                            token=gh_token,
+                        )
+                        remote_head = gh_cl_quick.get_remote_head_sha(
+                            pr_info.get("head_branch", "")
+                        )
+                        intended = (raw_claim.get("current_sha") or "").strip()
+                        if intended and local_head and remote_head:
+                            if int(intended[:12], 16) != int(remote_head[:12], 16):
+                                sha_stale = True
+                                logger.info(
+                                    f"[{task_id}] Stale SHA detected: "
+                                    f"ledger={intended[:8]} remote={remote_head[:8]} local={local_head[:8]}"
+                                )
+                    except Exception as e:
+                        logger.debug(f"[{task_id}] Could not check SHA staleness: {e}")
+
+                should_reconcile = (push_error or is_correction_pending or sha_stale) and claimed.workspace_path
+                logger.debug(f"[{task_id}] should_reconcile={should_reconcile} push_error={bool(push_error)} correction_pending={is_correction_pending} sha_stale={sha_stale}")
+
+                if should_reconcile:
+                    _json_line({
+                        "action": "push_state_reconciliation",
+                        "task_id": task_id,
+                        "reason": f"push_error={bool(push_error)}, correction_pending={is_correction_pending}, sha_stale={sha_stale}",
+                    })
+
+                    # Archive stale correction job files from prior dispatches
+                    ws_path = claimed.workspace_path or ""
+                    if ws_path:
+                        _archive_orphaned_jobs(task_id, ws_path)
+
+                    # Query GitHub for the actual remote PR head SHA
+                    gh_cl = GitHubClient(
+                        repo_owner=pr_info.get("repo_owner", ""),
+                        repo_name=pr_info.get("repo_name", ""),
+                        token=gh_token,
+                    )
+                    remote_sha_on_branch = gh_cl.get_remote_head_sha(
+                        pr_info.get("head_branch", "")
+                    )
+
+                    # Get local SHA from workspace
+                    r_local = subprocess.run(
+                        ["git", "rev-parse", "HEAD"],
+                        capture_output=True, text=True, timeout=5,
+                        cwd=ws_path,
+                    )
+                    local_sha = r_local.stdout.strip()
+
+                    # Compare remote vs expected corrected SHA
+                    intended_sha = raw_claim.get("current_sha", "") or local_sha
+
+                    if remote_sha_on_branch == intended_sha:
+                        _json_line({
+                            "action": "push_reconciled",
+                            "task_id": task_id,
+                            "remote_sha": remote_sha_on_branch[:8],
+                            "intended_sha": intended_sha[:8],
+                        })
+                        registry._ledger.set_task_status(task_id, "PENDING_REVIEW")
+                        raw = registry._ledger._data.get(task_id)
+                        if raw:
+                            raw["push_error"] = ""
+                            raw["remote_head_sha"] = remote_sha_on_branch
+                            # NEVER reset correction_count, _mock_scenario_index, or review_status here.
+                            # Those are task accounting data — reconciliation only updates push state.
+                            registry._ledger._save()
+                    elif remote_sha_on_branch == local_sha:
+                        _json_line({
+                            "action": "push_reconciled",
+                            "task_id": task_id,
+                            "remote_sha": remote_sha_on_branch[:8],
+                            "local_sha": local_sha[:8],
+                        })
+                        registry._ledger.set_task_status(task_id, "PENDING_REVIEW")
+                        raw = registry._ledger._data.get(task_id)
+                        if raw:
+                            raw["push_error"] = ""
+                            raw["remote_head_sha"] = remote_sha_on_branch
+                            raw["current_sha"] = local_sha
+                            registry._ledger._save()
+                    else:
+                        _json_line({
+                            "action": "sha_mismatch_detected",
+                            "task_id": task_id,
+                            "remote_sha": remote_sha_on_branch[:8],
+                            "intended_sha": intended_sha[:8] if intended_sha else "(none)",
+                            "local_sha": local_sha[:8] if local_sha else "(none)",
+                        })
+
+                        # If local workspace already has the corrected SHA, no push needed
+                        if local_sha == remote_sha_on_branch:
+                            _json_line({
+                                "action": "push_reconciled",
+                                "task_id": task_id,
+                                "remote_sha": remote_sha_on_branch[:8],
+                                "local_sha": local_sha[:8],
+                                "note": "workspace already matches remote — no push needed",
+                            })
+                            registry._ledger.set_task_status(task_id, "PENDING_REVIEW")
+                            raw = registry._ledger._data.get(task_id)
+                            if raw:
+                                raw["push_error"] = ""
+                                raw["remote_head_sha"] = remote_sha_on_branch
+                                raw["current_sha"] = local_sha
+                                registry._ledger._save()
+                            # Skip full pipeline — fall through to review_status handler
+                            # which will re-review the corrected SHA directly
+                        else:
+                            # Bounded push retries
+                            push_retries = raw_claim.get("_push_retry_count", 0)
+                            max_push_retries = 3
+                            if push_retries >= max_push_retries:
+                                _json_line({
+                                    "action": "push_max_retries_exhausted",
+                                    "task_id": task_id,
+                                    "retries": push_retries,
+                                })
+                                registry._ledger.release_task(
+                                    task_id, reason="push_max_retries_exhausted"
+                                )
+                                continue
+
+                            pushed, push_result = push_correction_to_github(
+                                repo_owner=pr_info.get("repo_owner", ""),
+                                repo_name=pr_info.get("repo_name", ""),
+                                head_branch=pr_info.get("head_branch", ""),
+                                token=gh_token,
+                                workspace_path=ws_path,
+                            )
+
+                            if pushed:
+                                _json_line({
+                                    "action": "push_retry_success",
+                                    "task_id": task_id,
+                                    "remote_sha": push_result[:8],
+                                    "retry_count": push_retries + 1,
+                                })
+                                registry._ledger.set_task_status(task_id, "PENDING_REVIEW")
+                                raw = registry._ledger._data.get(task_id)
+                                if raw:
+                                    raw["push_error"] = ""
+                                    raw["remote_head_sha"] = push_result
+                                    raw["_push_retry_count"] = push_retries + 1
+                                    registry._ledger._save()
+                            else:
+                                _json_line({
+                                    "action": "push_retry_failed",
+                                    "task_id": task_id,
+                                    "error": str(push_result)[:200],
+                                    "retry_count": push_retries + 1,
+                                })
+                                raw = registry._ledger._data.get(task_id)
+                                if raw:
+                                    raw["_push_retry_count"] = push_retries + 1
+                                    raw["status"] = "PUSH_PENDING"
+                                    registry._ledger._save()
+
+                # Always refresh claim data from ledger for post-reconciliation state
+                _now_data = registry._ledger._data.get(task_id, {})
+                _claimed_now = PRReviewTask.from_dict(_now_data)
+
+                # Build review context — NO credentials included (only after reconciliation)
                 review_ctx = build_review_context(
-                    PRReviewTask.from_dict(claimed.to_dict()),
+                    _claimed_now,
                     diff,
                     registry,
                 )
@@ -460,12 +762,15 @@ def _process_pr_once(
                     workspace_path=ws_path, state_dir=state_dir,
                 )
 
-                # Set up mock transport from env sequence
-                transport = _create_transport_from_env()
+                # Set up mock transport from env sequence (with per-task persistence)
+                transport = _create_transport_from_env(
+                    task_id=task_id,
+                    ledger_path=os.path.join(state_dir, "workflow_ledger.json"),
+                )
 
                 ws = loop.run(
                     task_id=task_id,
-                    requirements=review_ctx.get("requirements", claimed.requirements),
+                    requirements=review_ctx.get("requirements", _claimed_now.requirements),
                     acceptance_criteria=[],
                     code_context="",
                     mock_transport=transport,
@@ -489,8 +794,9 @@ def _process_pr_once(
                     registry._ledger.release_task(task_id, reason="blocked")
                     continue
 
-                # Handle PASS vs CHANGES_REQUIRED via review_status in ledger
-                rec = PRReviewTask.from_dict(claimed.to_dict())
+                # Fall through to review_status handler (state refreshed post-reconciliation)
+
+                rec = PRReviewTask.from_dict(_now_data)
                 if rec.review_status == "unreviewed":
                     # First review cycle — always expect changes first or pass
                     if final_disposition == Disposition.READY_FOR_OPERATOR_REVIEW:
@@ -586,6 +892,7 @@ def _process_pr_once(
                                     repo_name=pr_info.get("repo_name", ""),
                                     head_branch=pr_info.get("head_branch", ""),
                                     token=gh_token,
+                                    workspace_path=claimed.workspace_path or ws_path,
                                 )
 
                                 if not pushed:
@@ -596,14 +903,27 @@ def _process_pr_once(
                                         "error": str(push_result),
                                         "local_sha": ((new_sha or "")[:8] if new_sha else sha[:8]),
                                     })
+                                    # Keep in PENDING_REVIEW but mark as needing push-verify first
+                                    # so next controller run retries push before doing a fresh review
                                     registry._ledger.set_task_status(
-                                        task_id, "PUSH_PENDING", push_error=push_result,
+                                        task_id, "PENDING_REVIEW", push_error=push_result,
                                     )
-                                    continue  # skip review — will retry next controller run
+                                    raw = registry._ledger._data.get(task_id)
+                                    if raw:
+                                        raw["review_status"] = "unreviewed"  # re-discoverable
+                                        raw["remote_head_sha"] = ""  # force SHA mismatch → discovered
+                                    continue
 
-                                # Update ledger with verified remote SHA
+                                # Update ledger with verified remote SHA, then clear remote_head_sha
+                                # so the NEXT controller run will discover and re-review this PR
+                                # (the recorded SHA must differ from current GitHub SHA to trigger review)
                                 new_remote_sha = push_result  # this is the verified remote HEAD
-                                registry.update_task_sha(task_id, new_remote_sha)
+                                registry._ledger.set_task_status(task_id, "PENDING_REVIEW")
+                                raw = registry._ledger._data.get(task_id)
+                                if raw:
+                                    raw["remote_head_sha"] = ""  # clear to force re-discovery next run
+                                    raw["review_status"] = "unreviewed"
+                                    registry._ledger._save()
                                 _json_line({
                                     "action": "push_verified",
                                     "task_id": task_id,
