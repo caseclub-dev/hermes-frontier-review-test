@@ -18,10 +18,14 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
+import shutil
+import subprocess
+import tempfile
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 from .workflow_state import TaskRecord, WorkflowLedger
 
@@ -482,6 +486,105 @@ class GitHubClient:
             return {"state": data.get("state"), "draft": data.get("draft", True)}
         except Exception:
             return None
+
+
+def init_workspace_at_remote_head(
+    repo_owner: str,
+    repo_name: str,
+    head_branch: str,
+    expected_sha: str,
+    token: str,
+    existing_path: str = "",
+) -> tuple[str, str]:
+    """Initialize (or prepare) a Git workspace at the exact PR-head commit.
+
+    If *existing_path* already exists and its HEAD matches *expected_sha*,
+    returns (path, sha) immediately — no clone or fetch needed.
+
+    Otherwise creates a fresh clone of just the target branch, checked out
+    to the expected SHA in detached-HEAD state, so all future corrections
+    descend cleanly from the PR head with zero non-fast-forward risk.
+
+    Returns:
+        (workspace_path, verified_sha) — verified_sha == expected_sha.
+
+    Raises ValueError on auth failure or unreachable remote.
+    """
+
+    url = f"https://{token}@github.com/{repo_owner}/{repo_name}.git"
+
+    # 1. Check existing workspace
+    if existing_path and os.path.isdir(existing_path):
+        try:
+            r_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                capture_output=True, text=True, timeout=5, cwd=existing_path,
+            )
+            existing_sha = r_sha.stdout.strip()
+            if existing_sha == expected_sha:
+                return existing_path, existing_sha
+
+            # Workspace exists but SHA differs — will reclone below.
+        except Exception:
+            pass
+
+    # 2. Create fresh workspace via full branch clone (reliable for arbitrary SHAs)
+    base_dir = os.environ.get(
+        "FR_CORRECTION_WORKSPACE",
+        "/home/atlas/.hermes/cache/scratch"
+    )
+    os.makedirs(base_dir, exist_ok=True)
+    ws_path = tempfile.mkdtemp(dir=base_dir, prefix="fr_ws_")
+
+    # Clone the branch fully (not depth-1) so any SHA on that branch is reachable
+    r_clone = subprocess.run(
+        ["git", "clone", "--branch", head_branch, url, ws_path],
+        capture_output=True, text=True, timeout=120,
+    )
+    if r_clone.returncode != 0:
+        shutil.rmtree(ws_path, ignore_errors=True)
+        raise ValueError(
+            f"Failed to clone {repo_owner}/{repo_name} branch {head_branch}: "
+            f"{r_clone.stderr[:300]}"
+        )
+
+    # Verify the target SHA exists locally (it should be on this branch)
+    r_peek = subprocess.run(
+        ["git", "-C", ws_path, "cat-file", "-t", expected_sha],
+        capture_output=True, text=True, timeout=5,
+    )
+    if r_peek.returncode != 0:
+        raise ValueError(
+            f"SHA {expected_sha[:12]} not found in branch {head_branch} "
+            f"(clone may be stale or sha is incorrect)"
+        )
+
+    # Detach HEAD at the exact expected SHA
+    r_co = subprocess.run(
+        ["git", "-C", ws_path, "checkout", "--detach", expected_sha],
+        capture_output=True, text=True, timeout=10,
+    )
+    if r_co.returncode != 0:
+        raise ValueError(
+            f"Failed to checkout {expected_sha[:12]}: {r_co.stderr[:300]}"
+        )
+
+    # Verify workspace HEAD matches expected SHA
+    r_v = subprocess.run(
+        ["git", "-C", ws_path, "rev-parse", "HEAD"],
+        capture_output=True, text=True, timeout=5,
+    )
+    verified_sha = r_v.stdout.strip()
+    if not verified_sha:
+        raise ValueError(f"Workspace at {ws_path} has no HEAD commit after checkout")
+
+    # Ensure a local branch exists so Coder can commit on it
+    subprocess.run(
+        ["git", "-C", ws_path, "branch", "-M", head_branch],
+        capture_output=True, text=True, timeout=5,
+    )
+
+    return ws_path, verified_sha
 
 
 # ── Phase 3D helpers ────────────────────────────────────────────────────────────
