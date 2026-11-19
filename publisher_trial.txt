@@ -1,1 +1,2 @@
 Publisher trial: baseline
+Publisher trial: correction published through trusted identity.
