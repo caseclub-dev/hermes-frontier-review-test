@@ -295,10 +295,38 @@ def _process_once(
             # No job file but ledger says CORRECTION_PENDING — stale state.
             logger.warning(
                 f"[{task_id}] CORRECTION_PENDING without job file "
-                f"— archiving any orphaned jobs and transitioning to PENDING_REVIEW"
+                f"— checking for prior verdict before deciding recovery path"
             )
             _archive_orphaned_jobs(task_id, ws_path)
-            loop_for_check.ledger.set_task_status(task_id, "PENDING_REVIEW")
+
+            # Check ledger for existing review verdicts to avoid re-reviewing a SHA that was already rejected.
+            task_data = loop_for_check.ledger._data.get(task_id, {})
+            review_seq = task_data.get("review_sequence", [])
+            current_sha_val = task_data.get("current_sha", "") or claimed.current_sha or ""
+
+            has_changes_required_verdict = any(
+                e.get("type") == "review" and e.get("status") == "changes_required" and (
+                    not e.get("sha") or e.get("sha") == current_sha_val
+                )
+                for e in review_seq
+            )
+
+            if has_changes_required_verdict:
+                # Same SHA was already rejected — cannot recover without a valid correction job.
+                # Keep task blocked; do NOT re-enter PENDING_REVIEW where it could trigger
+                # an infinite re-review loop or a second Coder dispatch for the same bad code.
+                logger.error(
+                    f"[{task_id}] CORRECTION_PENDING without job file AND "
+                    f"prior CHANGES_REQUIRED verdict for current SHA — transitioning to BLOCKED"
+                )
+                loop_for_check.ledger.set_task_status(task_id, "BLOCKED")
+            else:
+                # No prior rejection recorded — safe to re-enter PENDING_REVIEW for fresh review.
+                logger.info(
+                    f"[{task_id}] CORRECTION_PENDING without job file and no prior CHANGES_REQUIRED "
+                    f"— transitioning to PENDING_REVIEW"
+                )
+                loop_for_check.ledger.set_task_status(task_id, "PENDING_REVIEW")
 
     if should_dispatch_correction:
         # ── Direct correction dispatch (Phase 3B) ────────────────
