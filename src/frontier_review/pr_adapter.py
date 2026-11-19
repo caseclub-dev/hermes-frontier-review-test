@@ -27,9 +27,76 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional, Tuple
 
+from urllib.request import Request as _Req, urlopen as _urlopen
+
 from .workflow_state import TaskRecord, WorkflowLedger
 
 logger = logging.getLogger(__name__)
+
+
+def verify_remote_sha(
+    repo_owner: str,
+    repo_name: str,
+    head_branch: str,
+    expected_sha: str,
+    token: str,
+    max_retries: int = 3,
+    retry_interval: float = 2.0,
+) -> tuple[bool, str]:
+    """Verify the remote HEAD SHA matches expected_sha with bounded retries.
+
+    GitHub CDN nodes may take 1–5 seconds to replicate a new SHA after push.
+    This function retries up to max_retries times with retry_interval delays
+    before failing definitively.
+
+    Args:
+        repo_owner: GitHub owner/org (e.g. "caseclub-dev").
+        repo_name: Repository name.
+        head_branch: Branch to check.
+        expected_sha: The 40-char SHA we expect to match.
+        token: GitHub API bearer token.
+        max_retries: Number of API attempts (default 3).
+        retry_interval: Seconds between retries (default 2.0).
+
+    Returns:
+        (True, sha) if the remote HEAD matches expected_sha.
+        (False, reason) on failure or after retries exhausted.
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "Hermes-Phase3D",
+    }
+
+    for attempt in range(1, max_retries + 1):
+        req = _Req(
+            f"https://api.github.com/repos/{repo_owner}/{repo_name}/git/refs/heads/{head_branch}",
+            headers=headers,
+        )
+        try:
+            with _urlopen(req, timeout=15) as resp:
+                remote_data = json.loads(resp.read())
+            remote_sha = remote_data.get("object", {}).get("sha", "")
+        except Exception as exc:
+            if attempt < max_retries:
+                time.sleep(retry_interval)
+                continue
+            return False, f"Failed to fetch remote SHA after {max_retries} attempts: {exc}"
+
+        if remote_sha == expected_sha:
+            return True, remote_sha
+
+        # Mismatch — retry unless last attempt
+        if attempt < max_retries:
+            time.sleep(retry_interval)
+            continue
+
+        # Exhausted retries
+        return False, (f"Remote SHA mismatch after {max_retries} retries: "
+                       f"local={expected_sha[:8]}, remote={remote_sha[:8]}")
+
+
+# ── Phase 3D helpers ────────────────────────────────────────────────────────────
 
 
 # ── Data model ───────────────────────────────────────────────────────────
@@ -704,30 +771,18 @@ def push_correction_to_github(
     if r_push.returncode != 0:
         return False, f"git push failed: {r_push.stderr[:300]}"
 
-    # 4. Verify remote SHA matches local (requirement 6)
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json",
-        "User-Agent": "Hermes-Phase3D",
-    }
-    from urllib.request import Request, urlopen as _urlopen
-    req = Request(
-        f"https://api.github.com/repos/{repo_owner}/{repo_name}/git/refs/heads/{head_branch}",
-        headers=headers,
+    # 4. Verify remote SHA matches local (requirement 6) — use bounded retries
+    success, result = verify_remote_sha(
+        repo_owner=repo_owner,
+        repo_name=repo_name,
+        head_branch=head_branch,
+        expected_sha=local_sha,
+        token=token,
     )
-    try:
-        with _urlopen(req, timeout=15) as resp:
-            remote_data = json.loads(resp.read())
-        remote_sha = remote_data.get("object", {}).get("sha", "")
-    except Exception as exc:
-        return False, f"Failed to fetch remote SHA after push: {exc}"
+    if not success:
+        return False, f"Remote SHA verification failed: {result}"
 
-    if remote_sha != local_sha:
-        # Remote HEAD differs from what we just pushed — stale or concurrent update
-        return False, (f"Remote SHA mismatch: local={local_sha[:8]}, "
-                       f"remote={remote_sha[:8]}")
-
-    return True, remote_sha
+    return True, result
 
 
 def verify_approval_prerequisites(
@@ -743,23 +798,21 @@ def verify_approval_prerequisites(
     Returns (True, '') if all checks pass, or (False, reason).
     Checks:
       1. PR is open and assigned to correct repo
-      2. Remote HEAD SHA matches reviewed SHA
+      2. Remote HEAD SHA matches reviewed SHA (with bounded retries)
     """
-    # Check 1 & 2: Remote HEAD SHA must match reviewed SHA
+    # Check 1: PR is open and on correct repo
     if not token or not repo_owner or not repo_name:
         return False, "Missing credentials for verification"
 
     from urllib.request import Request as _Req, urlopen as _urlopen
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json",
-        "User-Agent": "Hermes-Phase3D",
-    }
 
-    # Get PR state
     req = _Req(
         f"https://api.github.com/repos/{repo_owner}/{repo_name}/pulls/{pr_number}",
-        headers=headers,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "Hermes-Phase3D",
+        },
     )
     try:
         with _urlopen(req, timeout=15) as resp:
@@ -770,21 +823,16 @@ def verify_approval_prerequisites(
     if pr_data.get("state") != "open":
         return False, f"PR is {pr_data.get('state', 'unknown')}, not open — cannot approve"
 
-    # Get remote HEAD SHA
-    req2 = _Req(
-        f"https://api.github.com/repos/{repo_owner}/{repo_name}/git/refs/heads/{head_branch}",
-        headers=headers,
+    # Check 2: Remote HEAD SHA matches reviewed SHA (with bounded retries)
+    success, result = verify_remote_sha(
+        repo_owner=repo_owner,
+        repo_name=repo_name,
+        head_branch=head_branch,
+        expected_sha=reviewed_sha,
+        token=token,
     )
-    try:
-        with _urlopen(req2, timeout=15) as resp:
-            head_data = json.loads(resp.read())
-        remote_sha = head_data.get("object", {}).get("sha", "")
-    except Exception as exc:
-        return False, f"Failed to get branch SHA: {exc}"
-
-    if remote_sha != reviewed_sha:
-        return False, (f"Remote HEAD mismatch: reviewed={reviewed_sha[:8]}, "
-                       f"current remote={remote_sha[:8]}")
+    if not success:
+        return False, f"Remote SHA verification failed: {result}"
 
     return True, ""
 
