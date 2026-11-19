@@ -33,6 +33,14 @@ from .workflow_state import TaskRecord, WorkflowLedger
 
 logger = logging.getLogger(__name__)
 
+# Legacy correction-push disabled by default — requires explicit opt-in
+LEGACY_PUBLISH_ENABLED = os.environ.get("FR_LEGACY_PUBLISH") == "ENABLED"
+
+
+def legacy_publish_available() -> bool:
+    """Return True only when explicitly enabled via FR_LEGACY_PUBLISH=ENABLED."""
+    return LEGACY_PUBLISH_ENABLED
+
 
 def verify_remote_sha(
     repo_owner: str,
@@ -657,6 +665,25 @@ def init_workspace_at_remote_head(
 # ── Phase 3D helpers ────────────────────────────────────────────────────────────
 
 
+def verify_pr_state(
+    repo_owner: str,
+    repo_name: str,
+    pr_number: int,
+    head_branch: str,
+    force_mock: bool = False,
+) -> tuple[bool, str]:
+    """Verify PR state for publication authorization.
+
+    In mock mode: returns verified=True with mocked state.
+    In real mode (not yet implemented): would call GitHub API.
+    Returns (verified: bool, reason: str).
+    """
+    if force_mock:
+        return True, "PR verification passed (mock)"
+    # For this subphase: always return False — requires fr-publisher OS identity
+    return False, "PR verification requires fr-publisher OS identity — not available"
+
+
 def push_correction_to_github(
     repo_owner: str,
     repo_name: str,
@@ -675,6 +702,19 @@ def push_correction_to_github(
 
     Never force-push. Uses standard git push with credential helper.
     """
+    # Guard: legacy correction push must be explicitly enabled
+    if not LEGACY_PUBLISH_ENABLED:
+        return False, "Legacy correction push is disabled — enable via FR_LEGACY_PUBLISH=ENABLED"
+
+    # Verify PR state before any Git operations
+    verified, verify_reason = verify_pr_state(
+        repo_owner=repo_owner,
+        repo_name=repo_name,
+        pr_number=0,  # not available at this level; stub returns False by default
+        head_branch=head_branch,
+    )
+    if not verified:
+        return False, f"PR verification failed: {verify_reason}"
 
     # Determine working directory for git operations
     work_dir = workspace_path if workspace_path and os.path.isdir(workspace_path) else None

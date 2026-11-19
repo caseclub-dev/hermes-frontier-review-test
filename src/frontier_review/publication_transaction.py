@@ -107,7 +107,7 @@ class PublicationTransaction:
         self.head_branch = head_branch
         self.expected_remote_sha = expected_remote_sha
         self.proposed_new_sha = proposed_new_sha
-        self.state: str = "PENDING"  # PENDING | LOCKED | PUSHING | COMMITTED | ABORTED | RECOVERED
+        self.state: str = "PENDING"  # PENDING | LOCKED | PUSHING | COMMITTED | ABORTED | RECOVERED | CONSUMED_NO_PUSH
         self.actual_remote_sha: str | None = None
         self.error_message: str | None = None
         self.timestamp: datetime = datetime.now(timezone.utc)
@@ -247,6 +247,33 @@ class PublicationTransaction:
             "proposed_new_sha": self.proposed_new_sha[:8] if self.proposed_new_sha else None,
             "state": self.state,
             "error": self.error_message,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        self._append_log(record)
+
+    def consumed_no_push(self, error: str, reason: str = "") -> None:
+        """Mark the transaction as CONSUMED_NO_PUSH and persist to the log.
+
+        Use this when the correction budget was consumed but the push failed,
+        requiring manual reconciliation (do NOT auto-refund).
+
+        Args:
+            error: Description of why the push failed after consumption.
+            reason: Optional human-readable reason for audit trail.
+        """
+        self.state = "CONSUMED_NO_PUSH"
+        self.error_message = error[:200]
+        record = {
+            "transaction_id": self.transaction_id,
+            "pr_number": self.pr_number,
+            "repo_owner": self.repo_owner,
+            "repo_name": self.repo_name,
+            "head_branch": self.head_branch,
+            "expected_remote_sha": self.expected_remote_sha[:8],
+            "proposed_new_sha": self.proposed_new_sha[:8] if self.proposed_new_sha else None,
+            "state": self.state,
+            "error": self.error_message,
+            "reason": reason[:200] if reason else "",
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         self._append_log(record)

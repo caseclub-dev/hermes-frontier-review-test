@@ -34,6 +34,9 @@ api_key.txt
 htmlcov/
 *.cover
 
+# Test audit output — never committed
+tests/_audit_output/*.log
+
 # Generated test data
 tests/fixtures/generated/
 tests/output/

@@ -40,3 +40,19 @@ def _setup_test_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         pub_mod.PUB_STATE_DIR = state_dir
     except ImportError:
         pass
+
+    # Enable LEGACY_PUBLISH_ENABLED for all tests that exercise the guard path.
+    # Individual tests can override by setting pa_mod.LEGACY_PUBLISH_ENABLED = False.
+    try:
+        import frontier_review.pr_adapter as pa_mod
+
+        pa_mod.LEGACY_PUBLISH_ENABLED = True
+        monkeypatch.setattr(pa_mod, "LEGACY_PUBLISH_ENABLED", True)
+        # Mock verify_pr_state to return success for tests that call push_correction_to_github
+        monkeypatch.setattr(
+            pa_mod,
+            "verify_pr_state",
+            lambda *a, **k: (True, "PR verification passed (test mock)"),
+        )
+    except ImportError:
+        pass
