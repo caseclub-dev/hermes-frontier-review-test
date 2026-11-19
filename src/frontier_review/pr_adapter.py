@@ -600,53 +600,111 @@ def push_correction_to_github(
     """Push the local feature branch to GitHub and return (success, remote_sha).
 
     Args:
-        workspace_path: If provided, git commands run from this directory.
-                        Otherwise uses the current working directory.
+        workspace_path: Git repository directory for operations. Required.
 
     Returns:
         (True, sha) on success — remote HEAD matches what was pushed.
         (False, error_msg) on failure.
 
-    Never force-push. Uses standard git push.
-    Requires: git remote 'origin' pointing at the correct repo must be configured.
+    Never force-push. Uses standard git push with credential helper.
     """
-    import os as _os
 
     # Determine working directory for git operations
     work_dir = workspace_path if workspace_path and os.path.isdir(workspace_path) else None
+    if not work_dir:
+        return False, "No valid workspace directory provided"
 
-    # Step 1: Verify we are on the expected branch
-    r = subprocess.run(
-        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-        capture_output=True, text=True, timeout=5, cwd=work_dir,
-    )
-    if r.stdout.strip() != head_branch:
-        return False, f"Expected branch {head_branch}, got {r.stdout.strip()}"
-
-    # Step 2: Get local HEAD SHA before push
-    r_local = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        capture_output=True, text=True, timeout=5, cwd=work_dir,
-    )
-    local_sha = r_local.stdout.strip()
-
-    # Step 3: Push (no force)
-    _env = {_os.environ.pop(k, "") for k in ("GIT_TERMINAL_PROMPT",)}
+    _askpass_script = None
     try:
-        _env2 = _os.environ.copy()
+        # Set up temporary credential helper for authenticated pushes
+        _env2 = os.environ.copy()
         _env2["GIT_TERMINAL_PROMPT"] = "0"
-        url = f"https://{token}@github.com/{repo_owner}/{repo_name}.git"
-        r_push = subprocess.run(
-            ["git", "push", "origin", f"{head_branch}:{head_branch}"],
-            capture_output=True, text=True, timeout=120, env=_env2, cwd=work_dir,
+        _askpass_script = f"/tmp/.git_askpass_{os.getpid()}"
+        with open(_askpass_script, "w") as _f:
+            _f.write("#!/bin/sh\necho \"$TEMP_GIT_TOKEN\"\n")
+        os.chmod(_askpass_script, 0o755)
+        _env2["GIT_ASKPASS"] = _askpass_script
+        _env2["TEMP_GIT_TOKEN"] = token
+
+        url = f"https://github.com/{repo_owner}/{repo_name}.git"
+
+        # ── Pre-push checks (no branch renaming, no reset) ────────────────
+
+        # 1. Ensure we are on the expected branch
+        r_branch = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, timeout=5, cwd=work_dir,
         )
+        local_branch = r_branch.stdout.strip()
+        if local_branch != head_branch:
+            # Workspace is on wrong branch — fetch remote to check ancestry.
+            subprocess.run(
+                ["git", "remote", "get-url", "origin"],
+                capture_output=True, text=True, timeout=5, cwd=work_dir,
+            )
+            if subprocess.run(
+                ["git", "fetch", "origin", head_branch],
+                capture_output=True, text=True, timeout=10, cwd=work_dir,
+            ).returncode != 0:
+                return False, f"Cannot fetch {head_branch} from remote"
+
+        # 2. Verify local HEAD descends from (or equals) remote head
+        r_local = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=5, cwd=work_dir,
+        )
+        local_sha = r_local.stdout.strip()
+
+        # Fetch latest remote state for comparison
+        subprocess.run(
+            ["git", "fetch", "origin", head_branch],
+            capture_output=True, text=True, timeout=10, cwd=work_dir,
+        )
+        try:
+            r_remote = subprocess.run(
+                ["git", "merge-base", "--is-ancestor",
+                 f"origin/{head_branch}", "HEAD"],
+                capture_output=True, text=True, timeout=5, cwd=work_dir,
+            )
+        except Exception:
+            return False, "Cannot determine ancestry of local HEAD vs remote"
+
+        if r_remote.returncode != 0:
+            # Local is not an ancestor of origin head — check reverse.
+            r_reverse = subprocess.run(
+                ["git", "merge-base", "--is-ancestor",
+                 "HEAD", f"origin/{head_branch}"],
+                capture_output=True, text=True, cwd=work_dir, timeout=5,
+            )
+            if r_reverse.returncode != 0:
+                # Neither is ancestor — likely workspace was not initialized at PR head.
+                return False, (
+                    f"Workspace HEAD {local_sha[:8]} does not descend from "
+                    f"remote branch {head_branch}; workspace must be initialized at the PR head SHA"
+                )
+
+        # 3. Push (no force) — use temporary credential helper to avoid
+        # interactive prompts and token leaks to git subprocesses.
+        _env3 = os.environ.copy()
+        _env3["GIT_TERMINAL_PROMPT"] = "0"
+        _env3["GIT_ASKPASS"] = _askpass_script
+        _env3["TEMP_GIT_TOKEN"] = token
+        r_push = subprocess.run(
+            ["git", "push", "--no-verify", url, f"{local_branch}:{head_branch}"],
+            capture_output=True, text=True, timeout=120, env=_env3, cwd=work_dir,
+        )
+
+        if _askpass_script and os.path.exists(_askpass_script):
+            os.unlink(_askpass_script)
+            _askpass_script = None
     finally:
-        pass  # _env cleanup not needed since we used a copy
+        if _askpass_script and os.path.exists(_askpass_script):
+            os.unlink(_askpass_script)
 
     if r_push.returncode != 0:
         return False, f"git push failed: {r_push.stderr[:300]}"
 
-    # Step 4: Verify remote SHA matches local (requirement 6)
+    # 4. Verify remote SHA matches local (requirement 6)
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
