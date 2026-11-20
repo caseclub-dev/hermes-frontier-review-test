@@ -57,9 +57,9 @@ def test_lower_exceeds_upper():
         clamp(1, 5, 0)
 
 
-def test_lower_exceeds_upper_equal():
-    """equal is fine; strictly greater triggers the error."""
-    assert clamp(1, 2, 1)  # should NOT raise
+def test_lower_equals_upper():
+    """equal bounds are fine; strictly greater triggers the error."""
+    assert clamp(1, 2, 2) == 2  # lower == upper, value clamped to 2
 
 
 def test_negative_bounds_violation():
